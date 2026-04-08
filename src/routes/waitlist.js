@@ -1,17 +1,43 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
+const {
+  ROLES,
+  hasAnyRole,
+  sendForbidden,
+  loadAccessContext,
+  canAccessDoctor
+} = require('../lib/access');
 
 // GET all active waitlist entries
 router.get('/', async (req, res) => {
   try {
     const { doctor_id, status } = req.query;
+    await loadAccessContext(req);
+
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.DOCTOR)) {
+      return sendForbidden(res);
+    }
+
     let query = supabase
       .from('waitlist')
       .select('*, patients(*), doctors(*)')
       .order('added_at', { ascending: true });
 
-    if (doctor_id) query = query.eq('doctor_id', doctor_id);
+    if (hasAnyRole(req, ROLES.DOCTOR)) {
+      if (!req.user.doctorId) {
+        return sendForbidden(res, 'Doctor profile is not linked to this user');
+      }
+
+      query = query.eq('doctor_id', req.user.doctorId);
+
+      if (doctor_id && String(doctor_id) !== String(req.user.doctorId)) {
+        return sendForbidden(res);
+      }
+    } else if (doctor_id) {
+      query = query.eq('doctor_id', doctor_id);
+    }
+
     if (status) query = query.eq('status', status);
     else query = query.eq('status', 'waiting');
 
@@ -26,6 +52,10 @@ router.get('/', async (req, res) => {
 // POST add to waitlist
 router.post('/', async (req, res) => {
   try {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+      return sendForbidden(res);
+    }
+
     const { data, error } = await supabase
       .from('waitlist')
       .insert(req.body)
@@ -42,6 +72,28 @@ router.post('/', async (req, res) => {
 // PATCH update status
 router.patch('/:id/status', async (req, res) => {
   try {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.DOCTOR)) {
+      return sendForbidden(res);
+    }
+
+    if (hasAnyRole(req, ROLES.DOCTOR)) {
+      const { data: currentEntry, error: currentEntryError } = await supabase
+        .from('waitlist')
+        .select('id, doctor_id')
+        .eq('id', req.params.id)
+        .maybeSingle();
+
+      if (currentEntryError) throw currentEntryError;
+      if (!currentEntry) {
+        return res.status(404).json({ error: 'Waitlist entry not found' });
+      }
+
+      const allowed = await canAccessDoctor(req, currentEntry.doctor_id);
+      if (!allowed) {
+        return sendForbidden(res);
+      }
+    }
+
     const { data, error } = await supabase
       .from('waitlist')
       .update({ status: req.body.status })

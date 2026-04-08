@@ -1,4 +1,5 @@
 const supabase = require('../lib/supabase');
+const { ROLES, normalizeRole } = require('../lib/access');
 
 const authenticate = async (req, res, next) => {
   try {
@@ -21,7 +22,7 @@ const authenticate = async (req, res, next) => {
         return res.status(401).json({ error: 'Invalid API key' });
       }
 
-      req.user = { role: 'n8n_agent', id: data.id };
+      req.user = { role: ROLES.N8N_AGENT, id: data.id, accessContextLoaded: true };
       return next();
     }
 
@@ -33,16 +34,22 @@ const authenticate = async (req, res, next) => {
     }
 
     // Get user role from user_profiles
-    const { data: profile } = await supabase
+    const { data: profile, error: profileError } = await supabase
       .from('user_profiles')
       .select('role')
       .eq('user_id', user.id)
       .single();
 
+    if (profileError && profileError.code !== 'PGRST116') {
+      throw profileError;
+    }
+
     req.user = {
       id: user.id,
       email: user.email,
-      role: profile?.role || 'patient'
+      role: normalizeRole(profile?.role) || ROLES.PATIENT,
+      metadata: user.user_metadata || {},
+      accessContextLoaded: false
     };
 
     next();

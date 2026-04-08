@@ -4,6 +4,7 @@ const { createClient } = require('@supabase/supabase-js');
 const supabase = require('../lib/supabase');
 const authenticate = require('../middleware/auth');
 const authorizeRoles = require('../middleware/authorizeRoles');
+const { ROLES, STORED_ROLES, normalizeRole } = require('../lib/access');
 
 const router = express.Router();
 
@@ -49,10 +50,15 @@ const createUserAccount = async (req, res, options = {}) => {
   } = req.body || {};
   const resolvedFullName = full_name || name || null;
   const resolvedPassword = password || temporary_password;
-  const userRole = options.forceRole || role || 'patient';
+  const requestedRole = normalizeRole(options.forceRole || role || ROLES.PATIENT);
+  const userRole = STORED_ROLES.includes(requestedRole) ? requestedRole : null;
 
   if (!email || !resolvedPassword) {
     return res.status(400).json({ error: 'Email and password are required' });
+  }
+
+  if (!userRole) {
+    return res.status(400).json({ error: `role must be one of: ${STORED_ROLES.join(', ')}` });
   }
 
   let createdUserId;
@@ -117,13 +123,13 @@ const createUserAccount = async (req, res, options = {}) => {
 router.post('/signup', async (req, res) => createUserAccount(req, res));
 
 router.post('/register', async (req, res) => createUserAccount(req, res, {
-  forceRole: 'receptionist',
+  forceRole: ROLES.RECEPTIONIST,
   successMessage: 'Receptionist account created successfully',
   failureMessage: 'Failed to register receptionist'
 }));
 
 router.post('/register-admin', allowAdminBootstrap, async (req, res) => createUserAccount(req, res, {
-  forceRole: 'admin',
+  forceRole: ROLES.ADMIN,
   successMessage: 'Admin account created successfully',
   failureMessage: 'Failed to register admin'
 }));

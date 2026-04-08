@@ -1,10 +1,19 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
+const {
+  ROLES,
+  hasAnyRole,
+  sendForbidden
+} = require('../lib/access');
 
 // GET daily summary (n8n daily ops agent + admin dashboard)
 router.get('/daily', async (req, res) => {
   try {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.N8N_AGENT)) {
+      return sendForbidden(res);
+    }
+
     const { date } = req.query;
     const target = date ? new Date(date) : new Date();
 
@@ -70,6 +79,10 @@ router.get('/daily', async (req, res) => {
 // GET appointments per doctor (admin view)
 router.get('/doctors', async (req, res) => {
   try {
+    if (!hasAnyRole(req, ROLES.ADMIN)) {
+      return sendForbidden(res);
+    }
+
     const { from, to } = req.query;
 
     let query = supabase
@@ -107,6 +120,10 @@ router.get('/doctors', async (req, res) => {
 // GET no-show rate (n8n reminder agent uses this)
 router.get('/no-show-rate', async (req, res) => {
   try {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.N8N_AGENT)) {
+      return sendForbidden(res);
+    }
+
     const { days = 30 } = req.query;
     const from = new Date();
     from.setDate(from.getDate() - Number(days));
@@ -137,6 +154,10 @@ router.get('/no-show-rate', async (req, res) => {
 // GET upcoming appointments for next N hours (n8n reminder trigger)
 router.get('/upcoming', async (req, res) => {
   try {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.N8N_AGENT)) {
+      return sendForbidden(res);
+    }
+
     const { hours = 24 } = req.query;
     const now = new Date();
     const until = new Date(now.getTime() + Number(hours) * 60 * 60 * 1000);

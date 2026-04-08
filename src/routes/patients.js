@@ -1,6 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
+const {
+  ROLES,
+  hasAnyRole,
+  sendForbidden,
+  loadAccessContext,
+  canAccessPatient
+} = require('../lib/access');
 
 const toNullIfEmptyString = (value) => (value === '' ? null : value);
 
@@ -22,7 +29,35 @@ const sanitizePatientPayload = (payload = {}) => {
 router.get('/', async (req, res) => {
   try {
     const { search } = req.query;
+    await loadAccessContext(req);
+
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.DOCTOR)) {
+      return sendForbidden(res);
+    }
+
     let query = supabase.from('patients').select('*').order('created_at', { ascending: false });
+
+    if (hasAnyRole(req, ROLES.DOCTOR)) {
+      if (!req.user.doctorId) {
+        return sendForbidden(res, 'Doctor profile is not linked to this user');
+      }
+
+      const { data: appointments, error: appointmentError } = await supabase
+        .from('appointments')
+        .select('patient_id')
+        .eq('doctor_id', req.user.doctorId);
+
+      if (appointmentError) {
+        throw appointmentError;
+      }
+
+      const patientIds = [...new Set((appointments || []).map((appointment) => appointment.patient_id).filter(Boolean))];
+      if (!patientIds.length) {
+        return res.json([]);
+      }
+
+      query = query.in('id', patientIds);
+    }
 
     if (search) {
       query = query.or(`full_name.ilike.%${search}%,phone.ilike.%${search}%`);
@@ -39,6 +74,10 @@ router.get('/', async (req, res) => {
 // GET patient by phone (Aria voice agent uses this)
 router.get('/phone/:phone', async (req, res) => {
   try {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)) {
+      return sendForbidden(res);
+    }
+
     const { data, error } = await supabase
       .from('patients')
       .select('*')
@@ -55,6 +94,11 @@ router.get('/phone/:phone', async (req, res) => {
 // GET single patient by ID
 router.get('/:id', async (req, res) => {
   try {
+    const allowed = await canAccessPatient(req, req.params.id);
+    if (!allowed) {
+      return sendForbidden(res);
+    }
+
     const { data, error } = await supabase
       .from('patients')
       .select('*')
@@ -74,6 +118,10 @@ router.post('/', async (req, res) => {
   let authUserId = null;
 
   try {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+      return sendForbidden(res);
+    }
+
     if (resolvedPassword) {
       if (!patientData.email) {
         return res.status(400).json({ error: 'Email is required when password is provided' });
@@ -136,6 +184,15 @@ router.patch('/:id', async (req, res) => {
   const { patientData } = sanitizePatientPayload(req.body);
 
   try {
+    const allowed = await canAccessPatient(req, req.params.id);
+    if (!allowed) {
+      return sendForbidden(res);
+    }
+
+    if (hasAnyRole(req, ROLES.DOCTOR)) {
+      return sendForbidden(res);
+    }
+
     if (Object.keys(patientData).length === 0) {
       return res.status(400).json({ error: 'No valid patient fields provided' });
     }

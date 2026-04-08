@@ -1,6 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
+const {
+  ROLES,
+  hasAnyRole,
+  sendForbidden,
+  canAccessDoctor
+} = require('../lib/access');
 
 const toNullIfEmptyString = (value) => (value === '' ? null : value);
 
@@ -63,6 +69,10 @@ router.get('/:id', async (req, res) => {
 // POST create doctor (admin only)
 router.post('/', async (req, res) => {
   try {
+    if (!hasAnyRole(req, ROLES.ADMIN)) {
+      return sendForbidden(res);
+    }
+
     const normalizedBody = normalizeDoctorPayload(req.body);
     const { password, ...doctorData } = normalizedBody;
 
@@ -111,6 +121,11 @@ router.post('/', async (req, res) => {
 // PATCH update doctor
 router.patch('/:id', async (req, res) => {
   try {
+    const allowed = await canAccessDoctor(req, req.params.id);
+    if (!allowed && !hasAnyRole(req, ROLES.ADMIN)) {
+      return sendForbidden(res);
+    }
+
     const doctorData = normalizeDoctorPayload(req.body);
     const { data, error } = await supabase
       .from('doctors')
