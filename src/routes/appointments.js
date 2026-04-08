@@ -9,6 +9,7 @@ const {
   canAccessDoctor,
   getScopedDoctorId,
   canAccessPatient,
+  getScopedPatientId,
   canAccessAppointment,
   getAppointmentById
 } = require('../lib/access');
@@ -228,15 +229,15 @@ router.get('/doctor/:doctorId', async (req, res) => {
 // GET patient's appointments
 router.get('/patient/:patientId', async (req, res) => {
   try {
-    const allowed = await canAccessPatient(req, req.params.patientId);
-    if (!allowed) {
+    const scopedPatientId = await getScopedPatientId(req, req.params.patientId);
+    if (!scopedPatientId) {
       return sendForbidden(res);
     }
 
     const { data, error } = await supabase
       .from('appointments')
       .select('*, doctors(*)')
-      .eq('patient_id', req.params.patientId)
+      .eq('patient_id', scopedPatientId)
       .order('scheduled_at', { ascending: false });
 
     if (error) throw error;
