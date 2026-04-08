@@ -2,6 +2,8 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 
 const supabase = require('../lib/supabase');
+const authenticate = require('../middleware/auth');
+const authorizeRoles = require('../middleware/authorizeRoles');
 
 const router = express.Router();
 
@@ -15,6 +17,25 @@ const authClient = createClient(
     }
   }
 );
+
+const allowAdminBootstrap = (req, res, next) => {
+  const setupKey = req.headers['x-admin-setup-key'] || req.body?.setup_key;
+  const expectedSetupKey = process.env.ADMIN_SETUP_KEY;
+
+  if (!setupKey) {
+    return authenticate(req, res, () => authorizeRoles('admin')(req, res, next));
+  }
+
+  if (!expectedSetupKey) {
+    return res.status(503).json({ error: 'ADMIN_SETUP_KEY is not configured' });
+  }
+
+  if (setupKey !== expectedSetupKey) {
+    return res.status(403).json({ error: 'Invalid admin setup key' });
+  }
+
+  return next();
+};
 
 const createUserAccount = async (req, res, options = {}) => {
   const {
@@ -99,6 +120,12 @@ router.post('/register', async (req, res) => createUserAccount(req, res, {
   forceRole: 'receptionist',
   successMessage: 'Receptionist account created successfully',
   failureMessage: 'Failed to register receptionist'
+}));
+
+router.post('/register-admin', allowAdminBootstrap, async (req, res) => createUserAccount(req, res, {
+  forceRole: 'admin',
+  successMessage: 'Admin account created successfully',
+  failureMessage: 'Failed to register admin'
 }));
 
 router.post('/login', async (req, res) => {

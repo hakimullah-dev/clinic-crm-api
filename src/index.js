@@ -18,10 +18,24 @@ const authRouter = require('./routes/auth');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const allowedOrigins = [
+  'https://clinic-crm-frontend-seven.vercel.app',
+  'http://localhost:5173',
+  process.env.FRONTEND_URL
+].filter(Boolean);
 
 // Security & parsing
 app.use(helmet());
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173' }));
+app.use(cors({
+  origin(origin, callback) {
+    // Allow browser requests from known frontends and non-browser requests without an Origin header.
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error('Not allowed by CORS'));
+  }
+}));
 app.use(express.json());
 
 // Rate limiting
