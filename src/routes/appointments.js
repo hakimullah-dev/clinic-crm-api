@@ -98,10 +98,6 @@ router.get('/', async (req, res) => {
       }
 
       query = query.eq('doctor_id', req.user.doctorId);
-
-      if (doctor_id && String(doctor_id) !== String(req.user.doctorId)) {
-        return sendForbidden(res);
-      }
     } else if (hasAnyRole(req, ROLES.PATIENT)) {
       if (!req.user.patientId) {
         return sendForbidden(res, 'Patient profile is not linked to this user');
@@ -206,14 +202,14 @@ router.get('/slots/:doctorId', async (req, res) => {
 // GET doctor's schedule
 router.get('/doctor/:doctorId', async (req, res) => {
   try {
-    const allowed = await canAccessDoctor(req, req.params.doctorId);
-    if (!allowed) {
-      return sendForbidden(res);
-    }
-
     const scopedDoctorId = await getScopedDoctorId(req, req.params.doctorId);
     if (!scopedDoctorId) {
       return sendForbidden(res, 'Doctor profile is not linked to this user');
+    }
+
+    const allowed = await canAccessDoctor(req, scopedDoctorId);
+    if (!allowed) {
+      return sendForbidden(res);
     }
 
     const { data, error } = await supabase
