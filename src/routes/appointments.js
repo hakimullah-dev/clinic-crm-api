@@ -7,6 +7,7 @@ const {
   sendForbidden,
   loadAccessContext,
   canAccessDoctor,
+  getScopedDoctorId,
   canAccessPatient,
   canAccessAppointment,
   getAppointmentById
@@ -210,10 +211,15 @@ router.get('/doctor/:doctorId', async (req, res) => {
       return sendForbidden(res);
     }
 
+    const scopedDoctorId = await getScopedDoctorId(req, req.params.doctorId);
+    if (!scopedDoctorId) {
+      return sendForbidden(res, 'Doctor profile is not linked to this user');
+    }
+
     const { data, error } = await supabase
       .from('appointments')
       .select('*, patients(*)')
-      .eq('doctor_id', req.params.doctorId)
+      .eq('doctor_id', scopedDoctorId)
       .order('scheduled_at', { ascending: true });
 
     if (error) throw error;

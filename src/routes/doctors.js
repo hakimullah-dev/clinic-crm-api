@@ -5,7 +5,8 @@ const {
   ROLES,
   hasAnyRole,
   sendForbidden,
-  canAccessDoctor
+  canAccessDoctor,
+  getScopedDoctorId
 } = require('../lib/access');
 
 const toNullIfEmptyString = (value) => (value === '' ? null : value);
@@ -126,11 +127,16 @@ router.patch('/:id', async (req, res) => {
       return sendForbidden(res);
     }
 
+    const scopedDoctorId = await getScopedDoctorId(req, req.params.id);
+    if (!scopedDoctorId) {
+      return sendForbidden(res, 'Doctor profile is not linked to this user');
+    }
+
     const doctorData = normalizeDoctorPayload(req.body);
     const { data, error } = await supabase
       .from('doctors')
       .update(doctorData)
-      .eq('id', req.params.id)
+      .eq('id', scopedDoctorId)
       .select()
       .single();
 

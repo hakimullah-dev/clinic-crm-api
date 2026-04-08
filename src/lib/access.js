@@ -113,16 +113,39 @@ const doctorHasPatientAccess = async (doctorId, patientId) => {
 };
 
 const canAccessDoctor = async (req, doctorId) => {
-  if (!doctorId) {
-    return false;
-  }
-
   if (hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
-    return true;
+    return Boolean(doctorId);
   }
 
   await loadAccessContext(req);
-  return hasAnyRole(req, ROLES.DOCTOR) && String(req.user.doctorId) === String(doctorId);
+
+  if (!hasAnyRole(req, ROLES.DOCTOR)) {
+    return false;
+  }
+
+  if (!req.user.doctorId) {
+    return false;
+  }
+
+  if (!doctorId) {
+    return true;
+  }
+
+  return String(req.user.doctorId) === String(doctorId);
+};
+
+const getScopedDoctorId = async (req, requestedDoctorId) => {
+  if (hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+    return requestedDoctorId || null;
+  }
+
+  await loadAccessContext(req);
+
+  if (hasAnyRole(req, ROLES.DOCTOR)) {
+    return req.user.doctorId || null;
+  }
+
+  return null;
 };
 
 const canAccessPatient = async (req, patientId) => {
@@ -181,6 +204,7 @@ module.exports = {
   getAppointmentById,
   doctorHasPatientAccess,
   canAccessDoctor,
+  getScopedDoctorId,
   canAccessPatient,
   canAccessAppointment
 };
