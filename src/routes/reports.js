@@ -166,6 +166,7 @@ router.get('/upcoming', async (req, res) => {
       .from('appointments')
       .select('*, patients(full_name, phone, email), doctors(full_name)')
       .eq('status', 'confirmed')
+      .is('reminder_sent_at', null)
       .gte('scheduled_at', now.toISOString())
       .lte('scheduled_at', until.toISOString())
       .order('scheduled_at', { ascending: true });

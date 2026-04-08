@@ -40,7 +40,8 @@ const formatAppointmentSummary = (appointment) => ({
   doctor_name: appointment.doctors?.full_name || null,
   scheduled_at: appointment.scheduled_at,
   status: appointment.status,
-  notes: appointment.notes || null
+  notes: appointment.notes || null,
+  reminder_sent_at: appointment.reminder_sent_at || null
 });
 
 const getScopedAppointment = async (req, appointmentId, select) => {
@@ -60,9 +61,9 @@ const getScopedAppointment = async (req, appointmentId, select) => {
 
 const getAppointmentUpdatePayload = (body = {}, role) => {
   const allowedFieldsByRole = {
-    [ROLES.ADMIN]: ['doctor_id', 'patient_id', 'scheduled_at', 'status', 'notes'],
-    [ROLES.RECEPTIONIST]: ['doctor_id', 'patient_id', 'scheduled_at', 'status', 'notes'],
-    [ROLES.DOCTOR]: ['status', 'notes']
+    [ROLES.ADMIN]: ['doctor_id', 'patient_id', 'scheduled_at', 'status', 'notes', 'reminder_sent_at'],
+    [ROLES.RECEPTIONIST]: ['doctor_id', 'patient_id', 'scheduled_at', 'status', 'notes', 'reminder_sent_at'],
+    [ROLES.DOCTOR]: ['status', 'notes', 'reminder_sent_at']
   };
 
   const allowedFields = allowedFieldsByRole[role] || [];
@@ -80,7 +81,7 @@ const getAppointmentUpdatePayload = (body = {}, role) => {
 // GET all appointments with filters
 router.get('/', async (req, res) => {
   try {
-    const { date, doctor_id, status } = req.query;
+    const { date, doctor_id, status, from, to } = req.query;
 
     if (date && !isValidDateInput(date)) {
       return res.status(400).json({ error: 'date must be in YYYY-MM-DD format' });
@@ -116,6 +117,14 @@ router.get('/', async (req, res) => {
     if (date) {
       const { start, end } = buildDayRange(date);
       query = query.gte('scheduled_at', start.toISOString()).lte('scheduled_at', end.toISOString());
+    }
+
+    if (from) {
+      query = query.gte('scheduled_at', from);
+    }
+
+    if (to) {
+      query = query.lte('scheduled_at', to);
     }
 
     if (doctor_id && !hasAnyRole(req, ROLES.DOCTOR, ROLES.PATIENT)) {
@@ -327,6 +336,31 @@ router.patch('/:id/status', async (req, res) => {
       message: 'Appointment status updated successfully',
       appointment: formatAppointmentSummary(data)
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH mark reminder as sent
+router.patch('/:id/reminder-sent', async (req, res) => {
+  try {
+    const scoped = await getScopedAppointment(req, req.params.id, 'id, patient_id, doctor_id');
+    if (scoped.notFound) {
+      return res.status(404).json({ error: 'Appointment not found' });
+    }
+    if (scoped.forbidden) {
+      return sendForbidden(res);
+    }
+
+    const { data, error } = await supabase
+      .from('appointments')
+      .update({ reminder_sent_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .select('*, patients(*), doctors(*)')
+      .single();
+
+    if (error) throw error;
+    res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
