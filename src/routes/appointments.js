@@ -148,7 +148,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-// GET available slots for a doctor on a date
+// GET available slots for aa doctor on a date
 router.get('/slots/:doctorId', async (req, res) => {
   try {
     const { date } = req.query;
