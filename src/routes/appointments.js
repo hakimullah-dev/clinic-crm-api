@@ -1,6 +1,15 @@
 const express = require('express');
+const { z } = require('zod');
 const router = express.Router();
 const supabase = require('../lib/supabase');
+const validate = require('../middleware/validate');
+const {
+  APPOINTMENT_STATUSES,
+  appointmentCreateSchema,
+  appointmentPatchSchema,
+  appointmentRescheduleSchema,
+  appointmentStatusPatchSchema
+} = require('../lib/validators');
 const {
   ROLES,
   hasAnyRole,
@@ -13,9 +22,22 @@ const {
   canAccessAppointment,
   getAppointmentById
 } = require('../lib/access');
+const { fireWebhook, logAudit } = require('../lib/webhooks');
 
-const appointmentStatuses = ['pending', 'confirmed', 'completed', 'cancelled', 'no_show'];
+const appointmentStatuses = APPOINTMENT_STATUSES;
 const doctorStatusUpdateRoles = [ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.DOCTOR];
+const DEFAULT_PAGE = 1;
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 100;
+
+const paginationSchema = z.object({
+  page: z.coerce.number().int().min(1).default(DEFAULT_PAGE),
+  limit: z.coerce.number().int().min(1).max(MAX_LIMIT).default(DEFAULT_LIMIT)
+});
+
+const reminderSentSchema = z.object({
+  reminder_sent_at: z.string().datetime().optional()
+}).strict();
 
 const isValidDateInput = (value) => {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
@@ -30,6 +52,91 @@ const buildDayRange = (dateString) => {
   const start = new Date(`${dateString}T00:00:00.000Z`);
   const end = new Date(`${dateString}T23:59:59.999Z`);
   return { start, end };
+};
+
+const getPagination = (query = {}) => {
+  const { page, limit } = paginationSchema.parse(query);
+  const from = (page - 1) * limit;
+  const to = from + limit - 1;
+
+  return {
+    page,
+    limit,
+    from,
+    to
+  };
+};
+
+const buildPaginationMeta = (page, limit, total) => ({
+  page,
+  limit,
+  total,
+  pages: total === 0 ? 0 : Math.ceil(total / limit)
+});
+
+const syncPatientBookingSnapshot = async (patientId) => {
+  if (!patientId) {
+    return;
+  }
+
+  const [{ count: visitCount, error: countError }, { data: latestAppointment, error: latestError }] = await Promise.all([
+    supabase
+      .from('appointments')
+      .select('id', { count: 'exact', head: true })
+      .eq('patient_id', patientId)
+      .eq('status', 'completed'),
+    supabase
+      .from('appointments')
+      .select('doctor_id, scheduled_at, booking_source')
+      .eq('patient_id', patientId)
+      .in('status', ['completed', 'confirmed', 'pending', 'no_show'])
+      .order('scheduled_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+  ]);
+
+  if (countError) {
+    throw countError;
+  }
+
+  if (latestError) {
+    throw latestError;
+  }
+
+  const update = {
+    visit_count: visitCount || 0,
+    last_doctor_id: latestAppointment?.doctor_id || null,
+    last_booking_date: latestAppointment?.scheduled_at || null,
+    booking_source: latestAppointment?.booking_source || 'receptionist'
+  };
+
+  const { error: patientError } = await supabase
+    .from('patients')
+    .update(update)
+    .eq('id', patientId);
+
+  if (patientError) {
+    throw patientError;
+  }
+};
+
+const ensureSlotAvailable = async ({ appointmentId = null, doctorId, scheduledAt }) => {
+  const query = supabase
+    .from('appointments')
+    .select('id')
+    .eq('doctor_id', doctorId)
+    .eq('scheduled_at', scheduledAt)
+    .in('status', ['pending', 'confirmed', 'completed', 'no_show'])
+    .limit(1);
+
+  const scopedQuery = appointmentId ? query.neq('id', appointmentId) : query;
+  const { data, error } = await scopedQuery.maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  return !data;
 };
 
 const formatAppointmentSummary = (appointment) => ({
@@ -79,9 +186,10 @@ const getAppointmentUpdatePayload = (body = {}, role) => {
 };
 
 // GET all appointments with filters
-router.get('/', async (req, res) => {
+router.get('/', async (req, res, next) => {
   try {
     const { date, doctor_id, status, from, to } = req.query;
+    const { page, limit, from: rangeFrom, to: rangeTo } = getPagination(req.query);
 
     if (date && !isValidDateInput(date)) {
       return res.status(400).json({ error: 'date must be in YYYY-MM-DD format' });
@@ -91,7 +199,7 @@ router.get('/', async (req, res) => {
 
     let query = supabase
       .from('appointments')
-      .select('*, patients(*), doctors(*)')
+      .select('*, patients(*), doctors(*)', { count: 'exact' })
       .order('scheduled_at', { ascending: true });
 
     if (hasAnyRole(req, ROLES.DOCTOR)) {
@@ -135,21 +243,24 @@ router.get('/', async (req, res) => {
       query = query.eq('status', status);
     }
 
-    const { data, error } = await query;
+    const { data, error, count } = await query.range(rangeFrom, rangeTo);
     if (error) throw error;
 
-    if (date && hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
-      return res.json((data || []).map(formatAppointmentSummary));
-    }
+    const responseData = date && hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)
+      ? (data || []).map(formatAppointmentSummary)
+      : (data || []);
 
-    res.json(data || []);
+    res.json({
+      data: responseData,
+      pagination: buildPaginationMeta(page, limit, count || 0)
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // GET available slots for aa doctor on a date
-router.get('/slots/:doctorId', async (req, res) => {
+router.get('/slots/:doctorId', async (req, res, next) => {
   try {
     const { date } = req.query;
     if (!date) return res.status(400).json({ error: 'date query param required' });
@@ -162,7 +273,10 @@ router.get('/slots/:doctorId', async (req, res) => {
 
     if (docError) return res.status(404).json({ error: 'Doctor not found' });
 
-    const dayName = new Date(date).toLocaleDateString('en-US', { weekday: 'short' });
+    const dayName = new Date(date).toLocaleDateString('en-US', {
+      weekday: 'long',
+      timeZone: 'Australia/Brisbane'
+    });
     if (!doctor.working_days.includes(dayName)) {
       return res.json({ date, doctor_id: req.params.doctorId, available_slots: [], taken_slots: [] });
     }
@@ -205,12 +319,12 @@ router.get('/slots/:doctorId', async (req, res) => {
     const availableSlots = slots.filter((slot) => !takenSlots.includes(slot));
     res.json({ date, doctor_id: req.params.doctorId, available_slots: availableSlots, taken_slots: takenSlots });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // GET doctor's schedule
-router.get('/doctor/:doctorId', async (req, res) => {
+router.get('/doctor/:doctorId', async (req, res, next) => {
   try {
     const scopedDoctorId = await getScopedDoctorId(req, req.params.doctorId);
     if (!scopedDoctorId) {
@@ -231,12 +345,12 @@ router.get('/doctor/:doctorId', async (req, res) => {
     if (error) throw error;
     res.json(data || []);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // GET patient's appointments
-router.get('/patient/:patientId', async (req, res) => {
+router.get('/patient/:patientId', async (req, res, next) => {
   try {
     const scopedPatientId = await getScopedPatientId(req, req.params.patientId);
     if (!scopedPatientId) {
@@ -252,15 +366,28 @@ router.get('/patient/:patientId', async (req, res) => {
     if (error) throw error;
     res.json(data || []);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // POST create appointment
-router.post('/', async (req, res) => {
+router.post('/', async (req, res, next) => {
   try {
     await loadAccessContext(req);
 
+    if (hasAnyRole(req, ROLES.PATIENT) && req.user?.patientId) {
+      req.body = {
+        ...req.body,
+        patient_id: req.user.patientId
+      };
+    }
+
+    next();
+  } catch (err) {
+    next(err);
+  }
+}, validate(appointmentCreateSchema), async (req, res, next) => {
+  try {
     if (hasAnyRole(req, ROLES.PATIENT)) {
       if (!req.user.patientId) {
         return sendForbidden(res, 'Patient profile is not linked to this user');
@@ -285,29 +412,182 @@ router.post('/', async (req, res) => {
       .single();
 
     if (error) throw error;
+    await syncPatientBookingSnapshot(payload.patient_id);
     res.status(201).json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
+  }
+});
+
+router.delete('/:id', async (req, res, next) => {
+  try {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+      return sendForbidden(res);
+    }
+
+    const { data: appointment, error: appointmentError } = await supabase
+      .from('appointments')
+      .select('id, patient_id, status, scheduled_at, cancelled_at')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (appointmentError) {
+      throw appointmentError;
+    }
+
+    if (!appointment) {
+      return res.status(404).json({ error: 'Appointment not found' });
+    }
+
+    const cancelledAt = new Date().toISOString();
+    const { error: updateError } = await supabase
+      .from('appointments')
+      .update({
+        status: 'cancelled',
+        cancelled_at: cancelledAt
+      })
+      .eq('id', req.params.id);
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    await syncPatientBookingSnapshot(appointment.patient_id);
+
+    void fireWebhook('appointment.cancelled', {
+      appointment_id: appointment.id,
+      patient_id: appointment.patient_id,
+      cancelled_at: cancelledAt
+    });
+
+    await logAudit({
+      userId: req.user?.id || null,
+      role: req.user?.role || 'unknown',
+      action: 'appointment_cancelled',
+      resourceType: 'appointment',
+      resourceId: appointment.id,
+      oldValues: appointment,
+      newValues: {
+        status: 'cancelled',
+        cancelled_at: cancelledAt
+      },
+      ipAddress: req.ip
+    });
+
+    return res.json({
+      success: true,
+      appointment_id: appointment.id,
+      cancelled_at: cancelledAt
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/:id/reschedule', validate(appointmentRescheduleSchema), async (req, res, next) => {
+  try {
+    const { scheduled_at: scheduledAt, reason, google_event_id: googleEventId } = req.body;
+
+    const scoped = await getScopedAppointment(req, req.params.id, '*, patients(*), doctors(*)');
+    if (scoped.notFound) {
+      return res.status(404).json({ error: 'Appointment not found', details: [] });
+    }
+
+    const appointment = scoped.appointment;
+    const doctorAllowed = hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)
+      || (hasAnyRole(req, ROLES.DOCTOR) && String(req.user?.doctorId) === String(appointment.doctor_id));
+
+    if (!doctorAllowed) {
+      return sendForbidden(res);
+    }
+
+    const slotAvailable = await ensureSlotAvailable({
+      appointmentId: appointment.id,
+      doctorId: appointment.doctor_id,
+      scheduledAt
+    });
+
+    if (!slotAvailable) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: [
+          {
+            field: 'scheduled_at',
+            message: 'Selected slot is no longer available'
+          }
+        ]
+      });
+    }
+
+    const updatePayload = {
+      scheduled_at: scheduledAt,
+      cancellation_reason: reason || appointment.cancellation_reason || null,
+      cancelled_at: null
+    };
+
+    if (googleEventId) {
+      updatePayload.google_event_id = googleEventId;
+    }
+
+    const { data: updatedAppointment, error: updateError } = await supabase
+      .from('appointments')
+      .update(updatePayload)
+      .eq('id', appointment.id)
+      .select('*, patients(*), doctors(*)')
+      .single();
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    await syncPatientBookingSnapshot(appointment.patient_id);
+
+    void fireWebhook('appointment.rescheduled', {
+      appointment_id: appointment.id,
+      patient_id: appointment.patient_id,
+      doctor_id: appointment.doctor_id,
+      scheduled_at: scheduledAt,
+      reason: reason || null
+    });
+
+    await logAudit({
+      userId: req.user?.id || null,
+      role: req.user?.role || 'unknown',
+      action: 'appointment_rescheduled',
+      resourceType: 'appointment',
+      resourceId: appointment.id,
+      oldValues: {
+        scheduled_at: appointment.scheduled_at,
+        google_event_id: appointment.google_event_id || null
+      },
+      newValues: updatePayload,
+      ipAddress: req.ip
+    });
+
+    return res.json(updatedAppointment);
+  } catch (err) {
+    next(err);
   }
 });
 
 // PATCH update status
-router.patch('/:id/status', async (req, res) => {
+router.patch('/:id/status', validate(appointmentStatusPatchSchema), async (req, res, next) => {
   try {
     const appointmentId = req.params.id;
     const { status } = req.body || {};
 
     if (!appointmentId) {
-      return res.status(400).json({ error: 'Appointment id is required' });
+      return res.status(400).json({ error: 'Appointment id is required', details: [] });
     }
 
     if (!status || typeof status !== 'string') {
-      return res.status(400).json({ error: 'status is required' });
+      return res.status(400).json({ error: 'status is required', details: [] });
     }
 
     if (!appointmentStatuses.includes(status)) {
       return res.status(400).json({
-        error: `status must be one of: ${appointmentStatuses.join(', ')}`
+        error: `status must be one of: ${appointmentStatuses.join(', ')}`,
+        details: []
       });
     }
 
@@ -317,7 +597,7 @@ router.patch('/:id/status', async (req, res) => {
 
     const scoped = await getScopedAppointment(req, appointmentId, 'id, patient_id, doctor_id');
     if (scoped.notFound) {
-      return res.status(404).json({ error: 'Appointment not found' });
+      return res.status(404).json({ error: 'Appointment not found', details: [] });
     }
     if (scoped.forbidden) {
       return sendForbidden(res);
@@ -331,22 +611,43 @@ router.patch('/:id/status', async (req, res) => {
       .single();
 
     if (error) throw error;
+    const timestampUpdates = {};
+    if (status === 'completed') {
+      timestampUpdates.completed_at = new Date().toISOString();
+    }
+    if (status === 'cancelled') {
+      timestampUpdates.cancelled_at = new Date().toISOString();
+    }
+
+    if (Object.keys(timestampUpdates).length) {
+      const { error: timestampError } = await supabase
+        .from('appointments')
+        .update(timestampUpdates)
+        .eq('id', appointmentId);
+
+      if (timestampError) throw timestampError;
+      Object.assign(data, timestampUpdates);
+    }
 
     res.json({
       message: 'Appointment status updated successfully',
       appointment: formatAppointmentSummary(data)
     });
+
+    if (status === 'completed' || status === 'cancelled') {
+      void syncPatientBookingSnapshot(scoped.appointment.patient_id);
+    }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // PATCH mark reminder as sent
-router.patch('/:id/reminder-sent', async (req, res) => {
+router.patch('/:id/reminder-sent', validate(reminderSentSchema), async (req, res, next) => {
   try {
     const scoped = await getScopedAppointment(req, req.params.id, 'id, patient_id, doctor_id');
     if (scoped.notFound) {
-      return res.status(404).json({ error: 'Appointment not found' });
+      return res.status(404).json({ error: 'Appointment not found', details: [] });
     }
     if (scoped.forbidden) {
       return sendForbidden(res);
@@ -354,7 +655,7 @@ router.patch('/:id/reminder-sent', async (req, res) => {
 
     const { data, error } = await supabase
       .from('appointments')
-      .update({ reminder_sent_at: new Date().toISOString() })
+      .update({ reminder_sent_at: req.body.reminder_sent_at || new Date().toISOString() })
       .eq('id', req.params.id)
       .select('*, patients(*), doctors(*)')
       .single();
@@ -362,12 +663,12 @@ router.patch('/:id/reminder-sent', async (req, res) => {
     if (error) throw error;
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // PATCH update appointment
-router.patch('/:id', async (req, res) => {
+router.patch('/:id', validate(appointmentPatchSchema), async (req, res, next) => {
   try {
     if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.DOCTOR)) {
       return sendForbidden(res);
@@ -375,7 +676,7 @@ router.patch('/:id', async (req, res) => {
 
     const scoped = await getScopedAppointment(req, req.params.id, 'id, patient_id, doctor_id');
     if (scoped.notFound) {
-      return res.status(404).json({ error: 'Appointment not found' });
+      return res.status(404).json({ error: 'Appointment not found', details: [] });
     }
     if (scoped.forbidden) {
       return sendForbidden(res);
@@ -383,11 +684,11 @@ router.patch('/:id', async (req, res) => {
 
     const { payload, error: payloadError } = getAppointmentUpdatePayload(req.body, req.user.role);
     if (payloadError) {
-      return res.status(400).json({ error: payloadError });
+      return res.status(400).json({ error: payloadError, details: [] });
     }
 
     if (!Object.keys(payload).length) {
-      return res.status(400).json({ error: 'No valid appointment fields provided' });
+      return res.status(400).json({ error: 'No valid appointment fields provided', details: [] });
     }
 
     const { data, error } = await supabase
@@ -400,16 +701,16 @@ router.patch('/:id', async (req, res) => {
     if (error) throw error;
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // GET single appointment
-router.get('/:id', async (req, res) => {
+router.get('/:id', async (req, res, next) => {
   try {
     const scoped = await getScopedAppointment(req, req.params.id, '*, patients(*), doctors(*)');
     if (scoped.notFound) {
-      return res.status(404).json({ error: 'Appointment not found' });
+      return res.status(404).json({ error: 'Appointment not found', details: [] });
     }
     if (scoped.forbidden) {
       return sendForbidden(res);
@@ -417,7 +718,7 @@ router.get('/:id', async (req, res) => {
 
     res.json(scoped.appointment);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 

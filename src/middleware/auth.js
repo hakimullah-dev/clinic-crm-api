@@ -1,39 +1,65 @@
+const crypto = require('crypto');
+
+const { warn: logWarn, error: logError } = require('../lib/logger');
 const supabase = require('../lib/supabase');
 const { ROLES, normalizeRole } = require('../lib/access');
 
+const logSecurityEvent = (event, req, details = {}) => {
+  logWarn(event, {
+    requestId: req?.res?.locals?.requestId,
+    userId: req?.user?.id || null,
+    role: req?.user?.role || null,
+    path: req?.originalUrl,
+    method: req?.method,
+    ip: req?.ip,
+    ...details
+  });
+};
+
+const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
+
+/**
+ * Protects all authenticated API routes by accepting either a Supabase JWT
+ * or a hashed n8n agent API key and attaching a normalized security context to the request.
+ */
 const authenticate = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'No token provided' });
+      logSecurityEvent('auth_missing_bearer', req);
+      return res.status(401).json({ error: 'No bearer token provided. Send Authorization: Bearer <token> or a valid API key.', details: [] });
     }
 
     const token = authHeader.split(' ')[1];
 
-    // n8n API key check (starts with sk_)
     if (token.startsWith('sk_')) {
+      const tokenHash = sha256(token);
       const { data, error } = await supabase
         .from('api_keys')
-        .select('*')
-        .eq('key_hash', token)
+        .select('id, role')
+        .eq('key_hash', tokenHash)
         .single();
 
       if (error || !data) {
-        return res.status(401).json({ error: 'Invalid API key' });
+        logSecurityEvent('auth_invalid_api_key', req);
+        return res.status(401).json({ error: 'Invalid API key. Generate a new n8n agent key and retry the request.', details: [] });
       }
 
-      req.user = { role: ROLES.N8N_AGENT, id: data.id, accessContextLoaded: true };
+      req.user = {
+        role: normalizeRole(data.role) || ROLES.N8N_AGENT,
+        id: data.id,
+        accessContextLoaded: true
+      };
       return next();
     }
 
-    // Supabase JWT check
     const { data: { user }, error } = await supabase.auth.getUser(token);
 
     if (error || !user) {
-      return res.status(401).json({ error: 'Invalid token' });
+      logSecurityEvent('auth_invalid_jwt', req);
+      return res.status(401).json({ error: 'Invalid token. Refresh the session in the frontend and try again.', details: [] });
     }
 
-    // Get user role from user_profiles
     const { data: profile, error: profileError } = await supabase
       .from('user_profiles')
       .select('role')
@@ -54,7 +80,14 @@ const authenticate = async (req, res, next) => {
 
     next();
   } catch (err) {
-    res.status(500).json({ error: 'Auth error' });
+    logError('auth_middleware_error', {
+      requestId: req.res?.locals?.requestId,
+      path: req.originalUrl,
+      method: req.method,
+      ip: req.ip,
+      error: err.message
+    });
+    res.status(500).json({ error: 'Authentication failed due to a server-side issue. Check auth middleware logs and Supabase connectivity.', details: [] });
   }
 };
 

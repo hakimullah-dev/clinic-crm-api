@@ -41,7 +41,7 @@ const loadAccessContext = async (req) => {
   req.user.doctorId = req.user.doctorId || null;
   req.user.patientId = req.user.patientId || null;
 
-  if (!req.user.email) {
+  if (!req.user.id) {
     req.user.accessContextLoaded = true;
     return req.user;
   }
@@ -49,8 +49,8 @@ const loadAccessContext = async (req) => {
   if (getRequestRole(req) === ROLES.DOCTOR) {
     const { data, error } = await supabase
       .from('doctors')
-      .select('id')
-      .ilike('email', req.user.email)
+      .select('id, user_id')
+      .eq('user_id', req.user.id)
       .maybeSingle();
 
     if (error) {
@@ -58,13 +58,14 @@ const loadAccessContext = async (req) => {
     }
 
     req.user.doctorId = data?.id || null;
+    req.user.doctorUserId = data?.user_id || null;
   }
 
   if (getRequestRole(req) === ROLES.PATIENT) {
     const { data, error } = await supabase
       .from('patients')
-      .select('id')
-      .ilike('email', req.user.email)
+      .select('id, user_id')
+      .eq('user_id', req.user.id)
       .maybeSingle();
 
     if (error) {
@@ -72,6 +73,7 @@ const loadAccessContext = async (req) => {
     }
 
     req.user.patientId = data?.id || null;
+    req.user.patientUserId = data?.user_id || null;
   }
 
   req.user.accessContextLoaded = true;
@@ -131,7 +133,17 @@ const canAccessDoctor = async (req, doctorId) => {
     return true;
   }
 
-  return String(req.user.doctorId) === String(doctorId);
+  const { data, error } = await supabase
+    .from('doctors')
+    .select('user_id')
+    .eq('id', doctorId)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  return Boolean(data?.user_id) && String(data.user_id) === String(req.user.id);
 };
 
 const getScopedDoctorId = async (req, requestedDoctorId) => {
@@ -160,7 +172,17 @@ const canAccessPatient = async (req, patientId) => {
   }
 
   if (hasAnyRole(req, ROLES.PATIENT)) {
-    return String(req.user.patientId) === String(patientId);
+    const { data, error } = await supabase
+      .from('patients')
+      .select('user_id')
+      .eq('id', patientId)
+      .maybeSingle();
+
+    if (error) {
+      throw error;
+    }
+
+    return Boolean(data?.user_id) && String(data.user_id) === String(req.user.id);
   }
 
   if (hasAnyRole(req, ROLES.DOCTOR)) {

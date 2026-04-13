@@ -1,6 +1,9 @@
 const express = require('express');
+const { z } = require('zod');
 const router = express.Router();
 const supabase = require('../lib/supabase');
+const validate = require('../middleware/validate');
+const { patientCreateSchema, patientPatchSchema } = require('../lib/validators');
 const {
   ROLES,
   hasAnyRole,
@@ -8,17 +11,72 @@ const {
   loadAccessContext,
   canAccessPatient
 } = require('../lib/access');
+const DEFAULT_PAGE = 1;
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 100;
 
-const toNullIfEmptyString = (value) => (value === '' ? null : value);
+const paginationSchema = z.object({
+  page: z.coerce.number().int().min(1).default(DEFAULT_PAGE),
+  limit: z.coerce.number().int().min(1).max(MAX_LIMIT).default(DEFAULT_LIMIT)
+});
 
-const normalizePayload = (payload = {}) =>
-  Object.fromEntries(
-    Object.entries(payload).map(([key, value]) => [key, toNullIfEmptyString(value)])
-  );
+const getPagination = (query = {}) => {
+  const { page, limit } = paginationSchema.parse(query);
+  const from = (page - 1) * limit;
+  const to = from + limit - 1;
+
+  return { page, limit, from, to };
+};
+
+const buildPaginationMeta = (page, limit, total) => ({
+  page,
+  limit,
+  total,
+  pages: total === 0 ? 0 : Math.ceil(total / limit)
+});
+
+const syncPatientDerivedFields = async (patientId) => {
+  const [{ count: visitCount, error: countError }, { data: latestCompleted, error: latestError }] = await Promise.all([
+    supabase
+      .from('appointments')
+      .select('id', { count: 'exact', head: true })
+      .eq('patient_id', patientId)
+      .eq('status', 'completed'),
+    supabase
+      .from('appointments')
+      .select('doctor_id, scheduled_at, booking_source')
+      .eq('patient_id', patientId)
+      .eq('status', 'completed')
+      .order('scheduled_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+  ]);
+
+  if (countError) {
+    throw countError;
+  }
+
+  if (latestError) {
+    throw latestError;
+  }
+
+  const { error: updateError } = await supabase
+    .from('patients')
+    .update({
+      visit_count: visitCount || 0,
+      last_doctor_id: latestCompleted?.doctor_id || null,
+      last_booking_date: latestCompleted?.scheduled_at || null,
+      booking_source: latestCompleted?.booking_source || 'receptionist'
+    })
+    .eq('id', patientId);
+
+  if (updateError) {
+    throw updateError;
+  }
+};
 
 const sanitizePatientPayload = (payload = {}) => {
-  const normalizedPayload = normalizePayload(payload);
-  const { password, temporary_password, ...patientData } = normalizedPayload;
+  const { password, temporary_password, ...patientData } = payload;
   return {
     patientData,
     resolvedPassword: password || temporary_password || null
@@ -26,16 +84,20 @@ const sanitizePatientPayload = (payload = {}) => {
 };
 
 // GET all patients with search
-router.get('/', async (req, res) => {
+router.get('/', async (req, res, next) => {
   try {
     const { search } = req.query;
+    const { page, limit, from, to } = getPagination(req.query);
     await loadAccessContext(req);
 
     if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.DOCTOR)) {
       return sendForbidden(res);
     }
 
-    let query = supabase.from('patients').select('*').order('created_at', { ascending: false });
+    let query = supabase
+      .from('patients')
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false });
 
     if (hasAnyRole(req, ROLES.DOCTOR)) {
       if (!req.user.doctorId) {
@@ -63,16 +125,19 @@ router.get('/', async (req, res) => {
       query = query.or(`full_name.ilike.%${search}%,phone.ilike.%${search}%`);
     }
 
-    const { data, error } = await query;
+    const { data, error, count } = await query.range(from, to);
     if (error) throw error;
-    res.json(data);
+    res.json({
+      data: data || [],
+      pagination: buildPaginationMeta(page, limit, count || 0)
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // GET patient by phone (Aria voice agent uses this)
-router.get('/phone/:phone', async (req, res) => {
+router.get('/phone/:phone', async (req, res, next) => {
   try {
     if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)) {
       return sendForbidden(res);
@@ -87,12 +152,12 @@ router.get('/phone/:phone', async (req, res) => {
     if (error) return res.status(404).json({ error: 'Patient not found' });
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // GET single patient by ID
-router.get('/:id', async (req, res) => {
+router.get('/:id', async (req, res, next) => {
   try {
     const allowed = await canAccessPatient(req, req.params.id);
     if (!allowed) {
@@ -108,12 +173,12 @@ router.get('/:id', async (req, res) => {
     if (error) return res.status(404).json({ error: 'Patient not found' });
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // POST create patient
-router.post('/', async (req, res) => {
+router.post('/', validate(patientCreateSchema), async (req, res, next) => {
   const { patientData, resolvedPassword } = sanitizePatientPayload(req.body);
   let authUserId = null;
 
@@ -158,7 +223,10 @@ router.post('/', async (req, res) => {
 
     const { data, error } = await supabase
       .from('patients')
-      .insert(patientData)
+      .insert({
+        ...patientData,
+        user_id: authUserId
+      })
       .select()
       .single();
 
@@ -175,12 +243,12 @@ router.post('/', async (req, res) => {
 
     res.status(201).json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // PATCH update patient
-router.patch('/:id', async (req, res) => {
+router.patch('/:id', validate(patientPatchSchema), async (req, res, next) => {
   const { patientData } = sanitizePatientPayload(req.body);
 
   try {
@@ -205,9 +273,17 @@ router.patch('/:id', async (req, res) => {
       .single();
 
     if (error) throw error;
-    res.json(data);
+    await syncPatientDerivedFields(req.params.id);
+    const { data: refreshedPatient, error: refreshError } = await supabase
+      .from('patients')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+
+    if (refreshError) throw refreshError;
+    res.json(refreshedPatient || data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 

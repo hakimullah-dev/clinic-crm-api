@@ -1,64 +1,85 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 
+const config = require('../lib/config');
+const { error: logError, warn: logWarn, info: logInfo } = require('../lib/logger');
 const supabase = require('../lib/supabase');
 const authenticate = require('../middleware/auth');
 const authorizeRoles = require('../middleware/authorizeRoles');
-const { ROLES, STORED_ROLES, normalizeRole } = require('../lib/access');
+const validate = require('../middleware/validate');
+const { ROLES } = require('../lib/access');
+const {
+  authSignupSchema,
+  authRegisterSchema,
+  authRegisterAdminSchema,
+  authLoginSchema,
+  authLogoutSchema
+} = require('../lib/validators');
 
 const router = express.Router();
-
-const authClient = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false
+const globalAuthClient = globalThis;
+if (!globalAuthClient.__clinicCrmSupabaseAuthClient) {
+  globalAuthClient.__clinicCrmSupabaseAuthClient = createClient(
+    config.supabase.url,
+    config.supabase.anonKey,
+    {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false
+      }
     }
-  }
-);
+  );
+}
+const authClient = globalAuthClient.__clinicCrmSupabaseAuthClient;
 
-const allowAdminBootstrap = (req, res, next) => {
+const logSecurityEvent = (event, req, details = {}) => {
+  logWarn(event, {
+    requestId: req?.res?.locals?.requestId,
+    userId: req?.user?.id || null,
+    role: req?.user?.role || null,
+    path: req?.originalUrl,
+    method: req?.method,
+    ip: req?.ip,
+    ...details
+  });
+};
+
+/**
+ * Protects the admin bootstrap route by requiring a deployment-scoped setup key
+ * before permitting any admin account creation.
+ */
+const requireAdminSetupKey = (req, res, next) => {
   const setupKey = req.headers['x-admin-setup-key'] || req.body?.setup_key;
-  const expectedSetupKey = process.env.ADMIN_SETUP_KEY;
-
-  if (!setupKey) {
-    return authenticate(req, res, () => authorizeRoles('admin')(req, res, next));
-  }
+  const expectedSetupKey = config.security.adminSetupKey;
 
   if (!expectedSetupKey) {
-    return res.status(503).json({ error: 'ADMIN_SETUP_KEY is not configured' });
+    logSecurityEvent('admin_setup_key_missing', req);
+    return res.status(403).json({ error: 'Admin registration is disabled. Set ADMIN_SETUP_KEY in Vercel before calling /api/auth/register-admin.', details: [] });
   }
 
-  if (setupKey !== expectedSetupKey) {
-    return res.status(403).json({ error: 'Invalid admin setup key' });
+  if (!setupKey || setupKey !== expectedSetupKey) {
+    logSecurityEvent('admin_setup_key_invalid', req);
+    return res.status(403).json({ error: 'Invalid admin setup key. Pass the exact ADMIN_SETUP_KEY value in the x-admin-setup-key header.', details: [] });
   }
 
   return next();
 };
 
 const createUserAccount = async (req, res, options = {}) => {
+  const role = options.forceRole;
   const {
     email,
     full_name,
     name,
     password,
     temporary_password,
-    phone,
-    role
+    phone
   } = req.body || {};
   const resolvedFullName = full_name || name || null;
   const resolvedPassword = password || temporary_password;
-  const requestedRole = normalizeRole(options.forceRole || role || ROLES.PATIENT);
-  const userRole = STORED_ROLES.includes(requestedRole) ? requestedRole : null;
 
   if (!email || !resolvedPassword) {
-    return res.status(400).json({ error: 'Email and password are required' });
-  }
-
-  if (!userRole) {
-    return res.status(400).json({ error: `role must be one of: ${STORED_ROLES.join(', ')}` });
+    return res.status(400).json({ error: 'Email and password are required to create a user account.', details: [] });
   }
 
   let createdUserId;
@@ -75,7 +96,7 @@ const createUserAccount = async (req, res, options = {}) => {
     });
 
     if (createError || !createdUser.user) {
-      return res.status(400).json({ error: createError?.message || 'Unable to create user' });
+      return res.status(400).json({ error: createError?.message || 'Unable to create user. Verify the Supabase auth configuration and retry.', details: [] });
     }
 
     createdUserId = createdUser.user.id;
@@ -84,12 +105,12 @@ const createUserAccount = async (req, res, options = {}) => {
       .from('user_profiles')
       .insert({
         user_id: createdUserId,
-        role: userRole
+        role
       });
 
     if (profileError) {
       await supabase.auth.admin.deleteUser(createdUserId);
-      return res.status(400).json({ error: profileError.message });
+      return res.status(400).json({ error: profileError.message, details: [] });
     }
 
     const { data: loginData, error: loginError } = await authClient.auth.signInWithPassword({
@@ -97,10 +118,18 @@ const createUserAccount = async (req, res, options = {}) => {
       password: resolvedPassword
     });
 
+    logInfo('user_account_created', {
+      requestId: req.res?.locals?.requestId,
+      userId: createdUserId,
+      role,
+      path: req.originalUrl,
+      method: req.method
+    });
+
     if (loginError || !loginData.session || !loginData.user) {
       return res.status(201).json({
         user: createdUser.user,
-        role: userRole,
+        role,
         message: options.successMessage || 'User created successfully'
       });
     }
@@ -108,7 +137,7 @@ const createUserAccount = async (req, res, options = {}) => {
     return res.status(201).json({
       token: loginData.session.access_token,
       user: loginData.user,
-      role: userRole,
+      role,
       message: options.successMessage || 'User created successfully'
     });
   } catch (error) {
@@ -116,29 +145,47 @@ const createUserAccount = async (req, res, options = {}) => {
       await supabase.auth.admin.deleteUser(createdUserId);
     }
 
-    return res.status(500).json({ error: options.failureMessage || 'Failed to sign up user' });
+    logError('user_creation_failed', {
+      requestId: req.res?.locals?.requestId,
+      role,
+      path: req.originalUrl,
+      method: req.method,
+      ip: req.ip,
+      error: error.message
+    });
+    return res.status(500).json({ error: options.failureMessage || 'Failed to sign up user. Check Supabase availability and server logs for details.', details: [] });
   }
 };
 
-router.post('/signup', async (req, res) => createUserAccount(req, res));
+router.post('/signup', validate(authSignupSchema), async (req, res) => {
+  if (req.body?.role && String(req.body.role).trim().toLowerCase() !== ROLES.PATIENT) {
+    logSecurityEvent('role_escalation_attempt_signup', req);
+  }
 
-router.post('/register', async (req, res) => createUserAccount(req, res, {
+  return createUserAccount(req, res, {
+    forceRole: ROLES.PATIENT,
+    successMessage: 'Patient account created successfully',
+    failureMessage: 'Failed to sign up user'
+  });
+});
+
+router.post('/register', authenticate, authorizeRoles(ROLES.ADMIN), validate(authRegisterSchema), async (req, res) => createUserAccount(req, res, {
   forceRole: ROLES.RECEPTIONIST,
   successMessage: 'Receptionist account created successfully',
   failureMessage: 'Failed to register receptionist'
 }));
 
-router.post('/register-admin', allowAdminBootstrap, async (req, res) => createUserAccount(req, res, {
+router.post('/register-admin', requireAdminSetupKey, validate(authRegisterAdminSchema), async (req, res) => createUserAccount(req, res, {
   forceRole: ROLES.ADMIN,
   successMessage: 'Admin account created successfully',
   failureMessage: 'Failed to register admin'
 }));
 
-router.post('/login', async (req, res) => {
+router.post('/login', validate(authLoginSchema), async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required' });
+    return res.status(400).json({ error: 'Email and password are required to log in.', details: [] });
   }
 
   try {
@@ -148,7 +195,8 @@ router.post('/login', async (req, res) => {
     });
 
     if (error || !data.session || !data.user) {
-      return res.status(401).json({ error: error?.message || 'Invalid login credentials' });
+      logSecurityEvent('login_invalid_credentials', req);
+      return res.status(401).json({ error: error?.message || 'Invalid login credentials. Verify the email and password and try again.', details: [] });
     }
 
     const { data: profile, error: profileError } = await supabase
@@ -158,7 +206,7 @@ router.post('/login', async (req, res) => {
       .single();
 
     if (profileError && profileError.code !== 'PGRST116') {
-      return res.status(400).json({ error: profileError.message });
+      return res.status(400).json({ error: profileError.message, details: [] });
     }
 
     return res.json({
@@ -167,30 +215,44 @@ router.post('/login', async (req, res) => {
       role: profile?.role || 'patient'
     });
   } catch (error) {
-    return res.status(500).json({ error: 'Failed to log in user' });
+    logError('login_failed', {
+      requestId: req.res?.locals?.requestId,
+      path: req.originalUrl,
+      method: req.method,
+      ip: req.ip,
+      error: error.message
+    });
+    return res.status(500).json({ error: 'Failed to log in user. Check Supabase auth connectivity and retry.', details: [] });
   }
 });
 
-router.post('/logout', async (req, res) => {
+router.post('/logout', validate(authLogoutSchema), async (req, res) => {
   const authHeader = req.headers.authorization;
   const token = authHeader && authHeader.startsWith('Bearer ')
     ? authHeader.split(' ')[1]
     : req.body?.token;
 
   if (!token) {
-    return res.status(400).json({ error: 'Token is required' });
+    return res.status(400).json({ error: 'Token is required to log out the current session.', details: [] });
   }
 
   try {
     const { error } = await supabase.auth.admin.signOut(token);
 
     if (error) {
-      return res.status(400).json({ error: error.message });
+      return res.status(400).json({ error: error.message, details: [] });
     }
 
     return res.json({ message: 'Logged out successfully' });
   } catch (error) {
-    return res.status(500).json({ error: 'Failed to log out user' });
+    logError('logout_failed', {
+      requestId: req.res?.locals?.requestId,
+      path: req.originalUrl,
+      method: req.method,
+      ip: req.ip,
+      error: error.message
+    });
+    return res.status(500).json({ error: 'Failed to log out user. Check Supabase auth connectivity and retry.', details: [] });
   }
 });
 

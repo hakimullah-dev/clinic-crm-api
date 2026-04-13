@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
+const validate = require('../middleware/validate');
+const { intakeFormCreateSchema, intakeSummaryPatchSchema } = require('../lib/validators');
 const {
   ROLES,
   hasAnyRole,
@@ -25,15 +27,11 @@ const getScopedAppointment = async (req, appointmentId) => {
 };
 
 // POST submit intake form
-router.post('/', async (req, res) => {
+router.post('/', validate(intakeFormCreateSchema), async (req, res, next) => {
   try {
-    if (!req.body?.appointment_id) {
-      return res.status(400).json({ error: 'appointment_id is required' });
-    }
-
     const scopedAppointment = await getScopedAppointment(req, req.body.appointment_id);
     if (scopedAppointment.notFound) {
-      return res.status(404).json({ error: 'Appointment not found' });
+      return res.status(404).json({ error: 'Appointment not found', details: [] });
     }
     if (scopedAppointment.forbidden && !hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
       return sendForbidden(res);
@@ -48,16 +46,16 @@ router.post('/', async (req, res) => {
     if (error) throw error;
     res.status(201).json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // GET intake form by appointment ID
-router.get('/:appointmentId', async (req, res) => {
+router.get('/:appointmentId', async (req, res, next) => {
   try {
     const scopedAppointment = await getScopedAppointment(req, req.params.appointmentId);
     if (scopedAppointment.notFound) {
-      return res.status(404).json({ error: 'Appointment not found' });
+      return res.status(404).json({ error: 'Appointment not found', details: [] });
     }
     if (scopedAppointment.forbidden) {
       return sendForbidden(res);
@@ -72,12 +70,12 @@ router.get('/:appointmentId', async (req, res) => {
     if (error) return res.status(404).json({ error: 'Intake form not found' });
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // PATCH save AI summary
-router.patch('/:id/summary', async (req, res) => {
+router.patch('/:id/summary', validate(intakeSummaryPatchSchema), async (req, res, next) => {
   try {
     if (!hasAnyRole(req, ROLES.ADMIN, ROLES.DOCTOR)) {
       return sendForbidden(res);
@@ -91,7 +89,7 @@ router.patch('/:id/summary', async (req, res) => {
 
     if (intakeError) throw intakeError;
     if (!intakeForm) {
-      return res.status(404).json({ error: 'Intake form not found' });
+      return res.status(404).json({ error: 'Intake form not found', details: [] });
     }
 
     const scopedAppointment = await getScopedAppointment(req, intakeForm.appointment_id);
@@ -109,7 +107,7 @@ router.patch('/:id/summary', async (req, res) => {
     if (error) throw error;
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 

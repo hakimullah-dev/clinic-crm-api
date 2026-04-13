@@ -1,4 +1,5 @@
 const express = require('express');
+const { z } = require('zod');
 const router = express.Router();
 const supabase = require('../lib/supabase');
 const {
@@ -7,25 +8,147 @@ const {
   sendForbidden
 } = require('../lib/access');
 
-// GET daily summary (n8n daily ops agent + admin dashboard)
-router.get('/daily', async (req, res) => {
-  try {
-    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.N8N_AGENT)) {
-      return sendForbidden(res);
-    }
+const summaryCache = new Map();
+const SUMMARY_CACHE_TTL_MS = 5 * 60 * 1000;
+const summaryQuerySchema = z.object({
+  date: z.string().optional(),
+  from: z.string().optional(),
+  to: z.string().optional()
+});
 
-    const { date } = req.query;
-    const target = date ? new Date(date) : new Date();
+const getRangeBounds = (query = {}) => {
+  const parsed = summaryQuerySchema.parse(query);
+
+  if (parsed.date && (parsed.from || parsed.to)) {
+    throw Object.assign(new Error('Use either date or from/to range, not both'), { status: 400 });
+  }
+
+  if (parsed.date) {
+    const target = parsed.date === 'TODAY' ? new Date() : new Date(parsed.date);
+    if (Number.isNaN(target.getTime())) {
+      throw Object.assign(new Error('date must be a valid ISO date or TODAY'), { status: 400 });
+    }
 
     const start = new Date(target);
     start.setHours(0, 0, 0, 0);
     const end = new Date(target);
     end.setHours(23, 59, 59, 999);
 
-    const [appointments, feedback, waitlist] = await Promise.all([
+    return {
+      cacheKey: `date:${start.toISOString()}`,
+      start,
+      end
+    };
+  }
+
+  const start = parsed.from ? new Date(parsed.from) : new Date();
+  const end = parsed.to ? new Date(parsed.to) : new Date(start);
+
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    throw Object.assign(new Error('from and to must be valid ISO dates'), { status: 400 });
+  }
+
+  start.setHours(0, 0, 0, 0);
+  end.setHours(23, 59, 59, 999);
+
+  if (start > end) {
+    throw Object.assign(new Error('from must be before or equal to to'), { status: 400 });
+  }
+
+  return {
+    cacheKey: `range:${start.toISOString()}:${end.toISOString()}`,
+    start,
+    end
+  };
+};
+
+const getCachedSummary = (cacheKey) => {
+  const cached = summaryCache.get(cacheKey);
+  if (!cached) {
+    return null;
+  }
+
+  if (cached.expiresAt < Date.now()) {
+    summaryCache.delete(cacheKey);
+    return null;
+  }
+
+  return cached.payload;
+};
+
+const setCachedSummary = (cacheKey, payload) => {
+  summaryCache.set(cacheKey, {
+    payload,
+    expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS
+  });
+};
+
+const buildSummaryPayload = (appointmentsData, feedbackData, patientData, start, end) => {
+  const appointments = appointmentsData || [];
+  const feedback = feedbackData || [];
+  const patients = patientData || [];
+
+  const statusCounts = appointments.reduce((accumulator, appointment) => {
+    accumulator[appointment.status] = (accumulator[appointment.status] || 0) + 1;
+    return accumulator;
+  }, {});
+
+  const completedAppointments = appointments.filter((appointment) => appointment.status === 'completed');
+  const uniquePatientIds = new Set(completedAppointments.map((appointment) => appointment.patient_id).filter(Boolean));
+
+  const patientVisitMap = new Map((patients || []).map((patient) => [patient.id, patient.visit_count || 0]));
+  let newPatients = 0;
+  let returningPatients = 0;
+
+  uniquePatientIds.forEach((patientId) => {
+    const visits = patientVisitMap.get(patientId) || 0;
+    if (visits <= 1) {
+      newPatients += 1;
+    } else {
+      returningPatients += 1;
+    }
+  });
+
+  const avgRating = feedback.length
+    ? Number((feedback.reduce((sum, item) => sum + item.rating, 0) / feedback.length).toFixed(1))
+    : null;
+
+  const noShowRate = appointments.length
+    ? Number((((statusCounts.no_show || 0) / appointments.length) * 100).toFixed(1))
+    : 0;
+
+  return {
+    from: start.toISOString(),
+    to: end.toISOString(),
+    total_bookings: appointments.length,
+    confirmed: statusCounts.confirmed || 0,
+    cancelled: statusCounts.cancelled || 0,
+    completed: statusCounts.completed || 0,
+    no_shows: statusCounts.no_show || 0,
+    no_show_rate: noShowRate,
+    new_patients: newPatients,
+    returning_patients: returningPatients,
+    avg_rating: avgRating,
+    revenue_estimate: appointments.length * 200
+  };
+};
+
+const handleSummary = async (req, res, next) => {
+  try {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.N8N_AGENT)) {
+      return sendForbidden(res);
+    }
+
+    const { cacheKey, start, end } = getRangeBounds(req.query);
+    const cached = getCachedSummary(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const [appointments, feedback, patients] = await Promise.all([
       supabase
         .from('appointments')
-        .select('status, doctor_id, doctors(full_name)')
+        .select('status, patient_id')
         .gte('scheduled_at', start.toISOString())
         .lte('scheduled_at', end.toISOString()),
 
@@ -36,48 +159,34 @@ router.get('/daily', async (req, res) => {
         .lte('submitted_at', end.toISOString()),
 
       supabase
-        .from('waitlist')
-        .select('id')
-        .eq('status', 'waiting')
+        .from('patients')
+        .select('id, visit_count')
     ]);
 
-    const appts = appointments.data || [];
-    const fb = feedback.data || [];
-    const wl = waitlist.data || [];
+    if (appointments.error) throw appointments.error;
+    if (feedback.error) throw feedback.error;
+    if (patients.error) throw patients.error;
 
-    const statusCounts = appts.reduce((acc, a) => {
-      acc[a.status] = (acc[a.status] || 0) + 1;
-      return acc;
-    }, {});
+    const payload = buildSummaryPayload(
+      appointments.data,
+      feedback.data,
+      patients.data,
+      start,
+      end
+    );
 
-    const avgRating = fb.length
-      ? (fb.reduce((sum, f) => sum + f.rating, 0) / fb.length).toFixed(1)
-      : null;
-
-    res.json({
-      date: target.toISOString().split('T')[0],
-      appointments: {
-        total: appts.length,
-        confirmed: statusCounts.confirmed || 0,
-        completed: statusCounts.completed || 0,
-        cancelled: statusCounts.cancelled || 0,
-        no_show: statusCounts.no_show || 0
-      },
-      feedback: {
-        total_reviews: fb.length,
-        average_rating: avgRating
-      },
-      waitlist: {
-        active: wl.length
-      }
-    });
+    setCachedSummary(cacheKey, payload);
+    return res.json(payload);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
-});
+};
+
+router.get('/summary', handleSummary);
+router.get('/daily', handleSummary);
 
 // GET appointments per doctor (admin view)
-router.get('/doctors', async (req, res) => {
+router.get('/doctors', async (req, res, next) => {
   try {
     if (!hasAnyRole(req, ROLES.ADMIN)) {
       return sendForbidden(res);
@@ -113,12 +222,12 @@ router.get('/doctors', async (req, res) => {
 
     res.json(Object.values(stats));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // GET no-show rate (n8n reminder agent uses this)
-router.get('/no-show-rate', async (req, res) => {
+router.get('/no-show-rate', async (req, res, next) => {
   try {
     if (!hasAnyRole(req, ROLES.ADMIN, ROLES.N8N_AGENT)) {
       return sendForbidden(res);
@@ -147,12 +256,12 @@ router.get('/no-show-rate', async (req, res) => {
       no_show_rate_percent: rate
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // GET upcoming appointments for next N hours (n8n reminder trigger)
-router.get('/upcoming', async (req, res) => {
+router.get('/upcoming', async (req, res, next) => {
   try {
     if (!hasAnyRole(req, ROLES.ADMIN, ROLES.N8N_AGENT)) {
       return sendForbidden(res);
@@ -174,7 +283,7 @@ router.get('/upcoming', async (req, res) => {
     if (error) throw error;
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 

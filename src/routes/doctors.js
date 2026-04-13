@@ -1,6 +1,9 @@
 const express = require('express');
+const { z } = require('zod');
 const router = express.Router();
 const supabase = require('../lib/supabase');
+const validate = require('../middleware/validate');
+const { doctorCreateSchema, doctorPatchSchema } = require('../lib/validators');
 const {
   ROLES,
   hasAnyRole,
@@ -8,51 +11,46 @@ const {
   canAccessDoctor,
   getScopedDoctorId
 } = require('../lib/access');
+const DEFAULT_PAGE = 1;
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 100;
 
-const toNullIfEmptyString = (value) => (value === '' ? null : value);
-
-const normalizeDoctorPayload = (payload = {}) => {
-  const normalized = Object.fromEntries(
-    Object.entries(payload).map(([key, value]) => [key, toNullIfEmptyString(value)])
-  );
-
-  if (typeof normalized.working_days === 'string') {
-    const trimmed = normalized.working_days.trim();
-    if (!trimmed) {
-      normalized.working_days = [];
-    } else {
-      try {
-        const parsed = JSON.parse(trimmed);
-        normalized.working_days = Array.isArray(parsed)
-          ? parsed.map((item) => String(item).trim()).filter(Boolean)
-          : trimmed.split(',').map((item) => item.trim()).filter(Boolean);
-      } catch (_) {
-        normalized.working_days = trimmed.split(',').map((item) => item.trim()).filter(Boolean);
-      }
-    }
-  }
-
-  return normalized;
-};
+const paginationSchema = z.object({
+  page: z.coerce.number().int().min(1).default(DEFAULT_PAGE),
+  limit: z.coerce.number().int().min(1).max(MAX_LIMIT).default(DEFAULT_LIMIT)
+});
 
 // GET all active doctors
-router.get('/', async (req, res) => {
+router.get('/', async (req, res, next) => {
   try {
-    const { data, error } = await supabase
+    const { page, limit } = paginationSchema.parse(req.query);
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
+
+    const { data, error, count } = await supabase
       .from('doctors')
-      .select('*')
+      .select('*', { count: 'exact' })
       .eq('is_active', true)
-      .order('full_name', { ascending: true });
+      .order('full_name', { ascending: true })
+      .range(from, to);
 
     if (error) throw error;
-    res.json(data);
+    res.json({
+      data: data || [],
+      pagination: {
+        page,
+        limit,
+        total: count || 0,
+        pages: count ? Math.ceil(count / limit) : 0
+      }
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // GET single doctor
-router.get('/:id', async (req, res) => {
+router.get('/:id', async (req, res, next) => {
   try {
     const { data, error } = await supabase
       .from('doctors')
@@ -63,23 +61,34 @@ router.get('/:id', async (req, res) => {
     if (error) return res.status(404).json({ error: 'Doctor not found' });
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // POST create doctor (admin only)
-router.post('/', async (req, res) => {
+router.post('/', validate(doctorCreateSchema), async (req, res, next) => {
+  let authUserId = null;
+  let profileCreated = false;
+
   try {
     if (!hasAnyRole(req, ROLES.ADMIN)) {
       return sendForbidden(res);
     }
 
-    const normalizedBody = normalizeDoctorPayload(req.body);
-    const { password, ...doctorData } = normalizedBody;
+    const { password, ...doctorData } = req.body;
+    const resolvedPassword = password;
+
+    if (!doctorData.email) {
+      return res.status(400).json({ error: 'Email is required for doctor accounts' });
+    }
+
+    if (!resolvedPassword) {
+      return res.status(400).json({ error: 'Password is required for doctor accounts' });
+    }
 
     const { data: authData, error: authError } = await supabase.auth.admin.createUser({
       email: doctorData.email,
-      password: password || 'Doctor1234!',
+      password: resolvedPassword,
       email_confirm: true,
       user_metadata: { full_name: doctorData.full_name }
     });
@@ -89,6 +98,11 @@ router.post('/', async (req, res) => {
     }
 
     const authUser = authData.user;
+    if (!authUser) {
+      return res.status(400).json({ error: 'Unable to create doctor user' });
+    }
+
+    authUserId = authUser.id;
 
     const { error: profileError } = await supabase
       .from('user_profiles')
@@ -99,28 +113,44 @@ router.post('/', async (req, res) => {
 
     if (profileError) {
       await supabase.auth.admin.deleteUser(authUser.id);
+      authUserId = null;
       return res.status(400).json({ error: profileError.message });
     }
+    profileCreated = true;
 
     const { data, error } = await supabase
       .from('doctors')
-      .insert(doctorData)
+      .insert({
+        ...doctorData,
+        user_id: authUser.id
+      })
       .select()
       .single();
 
     if (error) {
+      if (profileCreated) {
+        await supabase.from('user_profiles').delete().eq('user_id', authUser.id);
+        profileCreated = false;
+      }
       await supabase.auth.admin.deleteUser(authUser.id);
+      authUserId = null;
       throw error;
     }
 
     res.status(201).json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    if (authUserId) {
+      if (profileCreated) {
+        await supabase.from('user_profiles').delete().eq('user_id', authUserId);
+      }
+      await supabase.auth.admin.deleteUser(authUserId);
+    }
+    next(err);
   }
 });
 
 // PATCH update doctor
-router.patch('/:id', async (req, res) => {
+router.patch('/:id', validate(doctorPatchSchema), async (req, res, next) => {
   try {
     const allowed = await canAccessDoctor(req, req.params.id);
     if (!allowed && !hasAnyRole(req, ROLES.ADMIN)) {
@@ -132,7 +162,7 @@ router.patch('/:id', async (req, res) => {
       return sendForbidden(res, 'Doctor profile is not linked to this user');
     }
 
-    const doctorData = normalizeDoctorPayload(req.body);
+    const doctorData = req.body;
     const { data, error } = await supabase
       .from('doctors')
       .update(doctorData)
@@ -143,7 +173,7 @@ router.patch('/:id', async (req, res) => {
     if (error) throw error;
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
