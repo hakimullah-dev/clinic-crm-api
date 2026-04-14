@@ -31,9 +31,16 @@ const authenticate = async (req, res, next) => {
     }
 
     const token = authHeader.split(' ')[1];
-     // 🔽 DEBUGGING LINES – paste these two lines
-    console.log('🔍 Token received:', token);
-    console.log('🔍 Starts with sk_?', token.startsWith('sk_'));
+     // 🔽 ADD THIS BLOCK – direct n8n API key from environment
+    const n8nApiKey = process.env.N8N_API_KEY;
+    if (n8nApiKey && token === n8nApiKey) {
+      req.user = {
+        role: ROLES.N8N_AGENT,
+        id: 'n8n_agent',
+        accessContextLoaded: true
+      };
+      return next();
+    }
 
 
     if (token.startsWith('sk_')) {
