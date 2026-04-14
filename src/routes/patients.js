@@ -183,7 +183,7 @@ router.post('/', validate(patientCreateSchema), async (req, res, next) => {
   let authUserId = null;
 
   try {
-    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)) {
       return sendForbidden(res);
     }
 

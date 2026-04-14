@@ -3,7 +3,7 @@ const { z } = require('zod');
 const router = express.Router();
 const supabase = require('../lib/supabase');
 const validate = require('../middleware/validate');
-const { waitlistCreateSchema, waitlistStatusPatchSchema } = require('../lib/validators');
+const { waitlistCreateSchema, waitlistStatusPatchSchema, waitlistPatchSchema } = require('../lib/validators');
 const {
   ROLES,
   hasAnyRole,
@@ -20,23 +20,40 @@ const paginationSchema = z.object({
   limit: z.coerce.number().int().min(1).max(MAX_LIMIT).default(DEFAULT_LIMIT)
 });
 
+const getWaitlistEntry = async (waitlistId) => {
+  const { data, error } = await supabase
+    .from('waitlist')
+    .select('id, doctor_id, status, offered_at')
+    .eq('id', waitlistId)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  return data;
+};
+
 // GET all active waitlist entries
 router.get('/', async (req, res, next) => {
   try {
-    const { doctor_id, status } = req.query;
+    const { doctor_id, doctorId, status, orderBy, order } = req.query;
     const { page, limit } = paginationSchema.parse(req.query);
     const from = (page - 1) * limit;
     const to = from + limit - 1;
+    const requestedDoctorId = doctor_id || doctorId;
+    const sortColumn = orderBy === 'created_at' ? 'added_at' : 'added_at';
+    const sortAscending = String(order || 'asc').toLowerCase() !== 'desc';
     await loadAccessContext(req);
 
-    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.DOCTOR)) {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.DOCTOR, ROLES.N8N_AGENT)) {
       return sendForbidden(res);
     }
 
     let query = supabase
       .from('waitlist')
       .select('*, patients(*), doctors(*)', { count: 'exact' })
-      .order('added_at', { ascending: true });
+      .order(sortColumn, { ascending: sortAscending });
 
     if (hasAnyRole(req, ROLES.DOCTOR)) {
       if (!req.user.doctorId) {
@@ -45,11 +62,11 @@ router.get('/', async (req, res, next) => {
 
       query = query.eq('doctor_id', req.user.doctorId);
 
-      if (doctor_id && String(doctor_id) !== String(req.user.doctorId)) {
+      if (requestedDoctorId && String(requestedDoctorId) !== String(req.user.doctorId)) {
         return sendForbidden(res);
       }
-    } else if (doctor_id) {
-      query = query.eq('doctor_id', doctor_id);
+    } else if (requestedDoctorId) {
+      query = query.eq('doctor_id', requestedDoctorId);
     }
 
     if (status) query = query.eq('status', status);
@@ -74,7 +91,7 @@ router.get('/', async (req, res, next) => {
 // POST add to waitlist
 router.post('/', validate(waitlistCreateSchema), async (req, res, next) => {
   try {
-    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)) {
       return sendForbidden(res);
     }
 
@@ -94,18 +111,12 @@ router.post('/', validate(waitlistCreateSchema), async (req, res, next) => {
 // PATCH update status
 router.patch('/:id/status', validate(waitlistStatusPatchSchema), async (req, res, next) => {
   try {
-    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.DOCTOR)) {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.DOCTOR, ROLES.N8N_AGENT)) {
       return sendForbidden(res);
     }
 
     if (hasAnyRole(req, ROLES.DOCTOR)) {
-      const { data: currentEntry, error: currentEntryError } = await supabase
-        .from('waitlist')
-        .select('id, doctor_id')
-        .eq('id', req.params.id)
-        .maybeSingle();
-
-      if (currentEntryError) throw currentEntryError;
+      const currentEntry = await getWaitlistEntry(req.params.id);
       if (!currentEntry) {
         return res.status(404).json({ error: 'Waitlist entry not found', details: [] });
       }
@@ -116,11 +127,53 @@ router.patch('/:id/status', validate(waitlistStatusPatchSchema), async (req, res
       }
     }
 
+    const statusPayload = { status: req.body.status };
+    if (req.body.status === 'offered') {
+      statusPayload.offered_at = new Date().toISOString();
+    }
+
     const { data, error } = await supabase
       .from('waitlist')
-      .update({ status: req.body.status })
+      .update(statusPayload)
       .eq('id', req.params.id)
       .select()
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch('/:id', validate(waitlistPatchSchema), async (req, res, next) => {
+  try {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.DOCTOR, ROLES.N8N_AGENT)) {
+      return sendForbidden(res);
+    }
+
+    const currentEntry = await getWaitlistEntry(req.params.id);
+    if (!currentEntry) {
+      return res.status(404).json({ error: 'Waitlist entry not found', details: [] });
+    }
+
+    if (hasAnyRole(req, ROLES.DOCTOR)) {
+      const allowed = await canAccessDoctor(req, currentEntry.doctor_id);
+      if (!allowed) {
+        return sendForbidden(res);
+      }
+    }
+
+    const updatePayload = { ...req.body };
+    if (updatePayload.status === 'offered' && !updatePayload.offered_at) {
+      updatePayload.offered_at = new Date().toISOString();
+    }
+
+    const { data, error } = await supabase
+      .from('waitlist')
+      .update(updatePayload)
+      .eq('id', req.params.id)
+      .select('*, patients(*), doctors(*)')
       .single();
 
     if (error) throw error;

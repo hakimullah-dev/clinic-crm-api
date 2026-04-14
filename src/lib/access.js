@@ -12,7 +12,8 @@ const STORED_ROLES = [
   ROLES.ADMIN,
   ROLES.DOCTOR,
   ROLES.RECEPTIONIST,
-  ROLES.PATIENT
+  ROLES.PATIENT,
+  ROLES.N8N_AGENT
 ];
 
 const normalizeRole = (role) => (
@@ -115,7 +116,7 @@ const doctorHasPatientAccess = async (doctorId, patientId) => {
 };
 
 const canAccessDoctor = async (req, doctorId) => {
-  if (hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+  if (hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)) {
     return Boolean(doctorId);
   }
 
@@ -147,7 +148,7 @@ const canAccessDoctor = async (req, doctorId) => {
 };
 
 const getScopedDoctorId = async (req, requestedDoctorId) => {
-  if (hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+  if (hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)) {
     return requestedDoctorId || null;
   }
 
@@ -161,7 +162,7 @@ const getScopedDoctorId = async (req, requestedDoctorId) => {
 };
 
 const canAccessPatient = async (req, patientId) => {
-  if (hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+  if (hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)) {
     return Boolean(patientId);
   }
 
@@ -193,7 +194,7 @@ const canAccessPatient = async (req, patientId) => {
 };
 
 const getScopedPatientId = async (req, requestedPatientId) => {
-  if (hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+  if (hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)) {
     return requestedPatientId || null;
   }
 
@@ -216,7 +217,7 @@ const canAccessAppointment = async (req, appointment) => {
     return false;
   }
 
-  if (hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+  if (hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)) {
     return true;
   }
 

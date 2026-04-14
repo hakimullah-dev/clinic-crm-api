@@ -168,9 +168,10 @@ const getScopedAppointment = async (req, appointmentId, select) => {
 
 const getAppointmentUpdatePayload = (body = {}, role) => {
   const allowedFieldsByRole = {
-    [ROLES.ADMIN]: ['doctor_id', 'patient_id', 'scheduled_at', 'status', 'notes', 'reminder_sent_at'],
-    [ROLES.RECEPTIONIST]: ['doctor_id', 'patient_id', 'scheduled_at', 'status', 'notes', 'reminder_sent_at'],
-    [ROLES.DOCTOR]: ['status', 'notes', 'reminder_sent_at']
+    [ROLES.ADMIN]: ['doctor_id', 'patient_id', 'scheduled_at', 'status', 'notes', 'reminder_sent_at', 'reminder_72h_sent', 'reminder_24h_sent', 'reminder_2h_sent', 'intake_form_sent', 'intake_form_sent_at'],
+    [ROLES.RECEPTIONIST]: ['doctor_id', 'patient_id', 'scheduled_at', 'status', 'notes', 'reminder_sent_at', 'reminder_72h_sent', 'reminder_24h_sent', 'reminder_2h_sent', 'intake_form_sent', 'intake_form_sent_at'],
+    [ROLES.DOCTOR]: ['status', 'notes', 'reminder_sent_at'],
+    [ROLES.N8N_AGENT]: ['scheduled_at', 'status', 'notes', 'reminder_sent_at', 'reminder_72h_sent', 'reminder_24h_sent', 'reminder_2h_sent', 'intake_form_sent', 'intake_form_sent_at']
   };
 
   const allowedFields = allowedFieldsByRole[role] || [];
@@ -188,7 +189,7 @@ const getAppointmentUpdatePayload = (body = {}, role) => {
 // GET all appointments with filters
 router.get('/', async (req, res, next) => {
   try {
-    const { date, doctor_id, status, from, to } = req.query;
+    const { date, doctor_id, status, from, to, hours, completedToday } = req.query;
     const { page, limit, from: rangeFrom, to: rangeTo } = getPagination(req.query);
 
     if (date && !isValidDateInput(date)) {
@@ -218,7 +219,7 @@ router.get('/', async (req, res, next) => {
       if (doctor_id) {
         query = query.eq('doctor_id', doctor_id);
       }
-    } else if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+    } else if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)) {
       return sendForbidden(res);
     }
 
@@ -233,6 +234,22 @@ router.get('/', async (req, res, next) => {
 
     if (to) {
       query = query.lte('scheduled_at', to);
+    }
+
+    if (hours) {
+      const now = new Date();
+      const until = new Date(now.getTime() + Number(hours) * 60 * 60 * 1000);
+      query = query.gte('scheduled_at', now.toISOString()).lte('scheduled_at', until.toISOString());
+    }
+
+    if (completedToday === 'true') {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      const end = new Date();
+      end.setHours(23, 59, 59, 999);
+      query = query.eq('status', 'completed')
+        .gte('scheduled_at', start.toISOString())
+        .lte('scheduled_at', end.toISOString());
     }
 
     if (doctor_id && !hasAnyRole(req, ROLES.DOCTOR, ROLES.PATIENT)) {
@@ -396,7 +413,7 @@ router.post('/', async (req, res, next) => {
       if (req.body?.patient_id && String(req.body.patient_id) !== String(req.user.patientId)) {
         return sendForbidden(res);
       }
-    } else if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+    } else if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)) {
       return sendForbidden(res);
     }
 
@@ -413,6 +430,16 @@ router.post('/', async (req, res, next) => {
 
     if (error) throw error;
     await syncPatientBookingSnapshot(payload.patient_id);
+
+    void fireWebhook('booking.complete', {
+      appointment_id: data.id,
+      patient_id: data.patient_id,
+      doctor_id: data.doctor_id,
+      scheduled_at: data.scheduled_at,
+      status: data.status,
+      booking_source: data.booking_source || payload.booking_source || null
+    });
+
     res.status(201).json(data);
   } catch (err) {
     next(err);
@@ -421,7 +448,7 @@ router.post('/', async (req, res, next) => {
 
 router.delete('/:id', async (req, res, next) => {
   try {
-    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)) {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)) {
       return sendForbidden(res);
     }
 
@@ -494,7 +521,7 @@ router.post('/:id/reschedule', validate(appointmentRescheduleSchema), async (req
     }
 
     const appointment = scoped.appointment;
-    const doctorAllowed = hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST)
+    const doctorAllowed = hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)
       || (hasAnyRole(req, ROLES.DOCTOR) && String(req.user?.doctorId) === String(appointment.doctor_id));
 
     if (!doctorAllowed) {
@@ -670,7 +697,7 @@ router.patch('/:id/reminder-sent', validate(reminderSentSchema), async (req, res
 // PATCH update appointment
 router.patch('/:id', validate(appointmentPatchSchema), async (req, res, next) => {
   try {
-    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.DOCTOR)) {
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.DOCTOR, ROLES.N8N_AGENT)) {
       return sendForbidden(res);
     }
 

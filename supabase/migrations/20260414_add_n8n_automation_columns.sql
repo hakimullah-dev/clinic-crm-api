@@ -1,0 +1,7 @@
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_72h_sent BOOLEAN DEFAULT false;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_24h_sent BOOLEAN DEFAULT false;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_2h_sent BOOLEAN DEFAULT false;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS intake_form_sent BOOLEAN DEFAULT false;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS intake_form_sent_at TIMESTAMPTZ;
+
+ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS offered_at TIMESTAMPTZ;

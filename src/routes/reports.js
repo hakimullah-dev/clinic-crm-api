@@ -24,7 +24,8 @@ const getRangeBounds = (query = {}) => {
   }
 
   if (parsed.date) {
-    const target = parsed.date === 'TODAY' ? new Date() : new Date(parsed.date);
+    const normalizedDate = parsed.date.trim().toLowerCase();
+    const target = normalizedDate === 'today' ? new Date() : new Date(parsed.date);
     if (Number.isNaN(target.getTime())) {
       throw Object.assign(new Error('date must be a valid ISO date or TODAY'), { status: 400 });
     }
@@ -275,7 +276,6 @@ router.get('/upcoming', async (req, res, next) => {
       .from('appointments')
       .select('*, patients(full_name, phone, email), doctors(full_name)')
       .eq('status', 'confirmed')
-      .is('reminder_sent_at', null)
       .gte('scheduled_at', now.toISOString())
       .lte('scheduled_at', until.toISOString())
       .order('scheduled_at', { ascending: true });

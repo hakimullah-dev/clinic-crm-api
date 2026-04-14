@@ -418,7 +418,12 @@ const appointmentPatchSchema = buildPatchSchema({
   status: appointmentShape.status,
   booking_source: z.enum(BOOKING_SOURCES).optional(),
   notes: appointmentShape.notes,
-  reminder_sent_at: optionalIsoDateTimeSchema
+  reminder_sent_at: optionalIsoDateTimeSchema,
+  reminder_72h_sent: z.boolean().optional(),
+  reminder_24h_sent: z.boolean().optional(),
+  reminder_2h_sent: z.boolean().optional(),
+  intake_form_sent: z.boolean().optional(),
+  intake_form_sent_at: optionalIsoDateTimeSchema
 }, ['id', 'created_at', 'user_id']);
 
 const appointmentStatusPatchSchema = buildCreateSchema({
@@ -444,6 +449,13 @@ const waitlistCreateSchema = buildCreateSchema(waitlistShape);
 
 const waitlistStatusPatchSchema = buildCreateSchema({
   status: waitlistShape.status
+});
+
+const waitlistPatchSchema = z.object({
+  status: waitlistShape.status.optional(),
+  offered_at: z.string().datetime('offered_at must be a valid ISO datetime string').optional()
+}).strict().refine((data) => Object.keys(data).length > 0, {
+  message: 'At least one waitlist field is required'
 });
 
 const intakeFormCreateSchema = z.object({
@@ -493,6 +505,7 @@ module.exports = {
   feedbackCreateSchema,
   waitlistCreateSchema,
   waitlistStatusPatchSchema,
+  waitlistPatchSchema,
   intakeFormCreateSchema,
   intakeSummaryPatchSchema,
   authSignupSchema,
