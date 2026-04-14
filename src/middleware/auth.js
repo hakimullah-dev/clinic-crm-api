@@ -31,6 +31,10 @@ const authenticate = async (req, res, next) => {
     }
 
     const token = authHeader.split(' ')[1];
+     // 🔽 DEBUGGING LINES – paste these two lines
+    console.log('🔍 Token received:', token);
+    console.log('🔍 Starts with sk_?', token.startsWith('sk_'));
+
 
     if (token.startsWith('sk_')) {
       const tokenHash = sha256(token);
