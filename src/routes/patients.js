@@ -24,7 +24,6 @@ const getPagination = (query = {}) => {
   const { page, limit } = paginationSchema.parse(query);
   const from = (page - 1) * limit;
   const to = from + limit - 1;
-
   return { page, limit, from, to };
 };
 
@@ -34,46 +33,6 @@ const buildPaginationMeta = (page, limit, total) => ({
   total,
   pages: total === 0 ? 0 : Math.ceil(total / limit)
 });
-
-const syncPatientDerivedFields = async (patientId) => {
-  const [{ count: visitCount, error: countError }, { data: latestCompleted, error: latestError }] = await Promise.all([
-    supabase
-      .from('appointments')
-      .select('id', { count: 'exact', head: true })
-      .eq('patient_id', patientId)
-      .eq('status', 'completed'),
-    supabase
-      .from('appointments')
-      .select('doctor_id, scheduled_at, booking_source')
-      .eq('patient_id', patientId)
-      .eq('status', 'completed')
-      .order('scheduled_at', { ascending: false })
-      .limit(1)
-      .maybeSingle()
-  ]);
-
-  if (countError) {
-    throw countError;
-  }
-
-  if (latestError) {
-    throw latestError;
-  }
-
-  const { error: updateError } = await supabase
-    .from('patients')
-    .update({
-      visit_count: visitCount || 0,
-      last_doctor_id: latestCompleted?.doctor_id || null,
-      last_booking_date: latestCompleted?.scheduled_at || null,
-      booking_source: latestCompleted?.booking_source || 'receptionist'
-    })
-    .eq('id', patientId);
-
-  if (updateError) {
-    throw updateError;
-  }
-};
 
 const sanitizePatientPayload = (payload = {}) => {
   const { password, temporary_password, ...patientData } = payload;
@@ -103,21 +62,13 @@ router.get('/', async (req, res, next) => {
       if (!req.user.doctorId) {
         return sendForbidden(res, 'Doctor profile is not linked to this user');
       }
-
       const { data: appointments, error: appointmentError } = await supabase
         .from('appointments')
         .select('patient_id')
         .eq('doctor_id', req.user.doctorId);
-
-      if (appointmentError) {
-        throw appointmentError;
-      }
-
-      const patientIds = [...new Set((appointments || []).map((appointment) => appointment.patient_id).filter(Boolean))];
-      if (!patientIds.length) {
-        return res.json([]);
-      }
-
+      if (appointmentError) throw appointmentError;
+      const patientIds = [...new Set((appointments || []).map((a) => a.patient_id).filter(Boolean))];
+      if (!patientIds.length) return res.json({ data: [], pagination: buildPaginationMeta(page, limit, 0) });
       query = query.in('id', patientIds);
     }
 
@@ -136,19 +87,17 @@ router.get('/', async (req, res, next) => {
   }
 });
 
-// GET patient by phone (Aria voice agent uses this)
+// GET patient by phone (Aria uses this)
 router.get('/phone/:phone', async (req, res, next) => {
   try {
     if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)) {
       return sendForbidden(res);
     }
-
     const { data, error } = await supabase
       .from('patients')
       .select('*')
       .eq('phone', req.params.phone)
       .single();
-
     if (error) return res.status(404).json({ error: 'Patient not found' });
     res.json(data);
   } catch (err) {
@@ -160,16 +109,12 @@ router.get('/phone/:phone', async (req, res, next) => {
 router.get('/:id', async (req, res, next) => {
   try {
     const allowed = await canAccessPatient(req, req.params.id);
-    if (!allowed) {
-      return sendForbidden(res);
-    }
-
+    if (!allowed) return sendForbidden(res);
     const { data, error } = await supabase
       .from('patients')
       .select('*')
       .eq('id', req.params.id)
       .single();
-
     if (error) return res.status(404).json({ error: 'Patient not found' });
     res.json(data);
   } catch (err) {
@@ -177,7 +122,7 @@ router.get('/:id', async (req, res, next) => {
   }
 });
 
-// POST create patient
+// POST create patient (fixed: removed user_id)
 router.post('/', validate(patientCreateSchema), async (req, res, next) => {
   const { patientData, resolvedPassword } = sanitizePatientPayload(req.body);
   let authUserId = null;
@@ -187,11 +132,11 @@ router.post('/', validate(patientCreateSchema), async (req, res, next) => {
       return sendForbidden(res);
     }
 
+    // If password provided, create Supabase Auth user and profile (but don't link to patients table)
     if (resolvedPassword) {
       if (!patientData.email) {
         return res.status(400).json({ error: 'Email is required when password is provided' });
       }
-
       const { data: authData, error: authError } = await supabase.auth.admin.createUser({
         email: patientData.email,
         password: resolvedPassword,
@@ -201,41 +146,30 @@ router.post('/', validate(patientCreateSchema), async (req, res, next) => {
           phone: patientData.phone || null
         }
       });
-
       if (authError || !authData.user) {
         return res.status(400).json({ error: authError?.message || 'Unable to create patient user' });
       }
-
       authUserId = authData.user.id;
-
       const { error: profileError } = await supabase
         .from('user_profiles')
-        .insert({
-          user_id: authUserId,
-          role: 'patient'
-        });
-
+        .insert({ user_id: authUserId, role: 'patient' });
       if (profileError) {
         await supabase.auth.admin.deleteUser(authUserId);
         return res.status(400).json({ error: profileError.message });
       }
     }
 
+    // Insert into patients table WITHOUT user_id (since column doesn't exist)
     const { data, error } = await supabase
       .from('patients')
-      .insert({
-        ...patientData,
-        user_id: authUserId
-      })
+      .insert(patientData)   // removed user_id
       .select()
       .single();
 
     if (error) {
+      // Rollback auth user if created
       if (authUserId) {
-        await supabase
-          .from('user_profiles')
-          .delete()
-          .eq('user_id', authUserId);
+        await supabase.from('user_profiles').delete().eq('user_id', authUserId);
         await supabase.auth.admin.deleteUser(authUserId);
       }
       throw error;
@@ -250,38 +184,21 @@ router.post('/', validate(patientCreateSchema), async (req, res, next) => {
 // PATCH update patient
 router.patch('/:id', validate(patientPatchSchema), async (req, res, next) => {
   const { patientData } = sanitizePatientPayload(req.body);
-
   try {
     const allowed = await canAccessPatient(req, req.params.id);
-    if (!allowed) {
-      return sendForbidden(res);
-    }
-
-    if (hasAnyRole(req, ROLES.DOCTOR)) {
-      return sendForbidden(res);
-    }
-
+    if (!allowed) return sendForbidden(res);
+    if (hasAnyRole(req, ROLES.DOCTOR)) return sendForbidden(res);
     if (Object.keys(patientData).length === 0) {
       return res.status(400).json({ error: 'No valid patient fields provided' });
     }
-
     const { data, error } = await supabase
       .from('patients')
       .update(patientData)
       .eq('id', req.params.id)
       .select()
       .single();
-
     if (error) throw error;
-    await syncPatientDerivedFields(req.params.id);
-    const { data: refreshedPatient, error: refreshError } = await supabase
-      .from('patients')
-      .select('*')
-      .eq('id', req.params.id)
-      .single();
-
-    if (refreshError) throw refreshError;
-    res.json(refreshedPatient || data);
+    res.json(data);
   } catch (err) {
     next(err);
   }
