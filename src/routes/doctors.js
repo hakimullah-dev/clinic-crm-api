@@ -1,6 +1,7 @@
 const express = require('express');
 const { z } = require('zod');
 const router = express.Router();
+const publicRouter = express.Router();
 const supabase = require('../lib/supabase');
 const validate = require('../middleware/validate');
 const { doctorCreateSchema, doctorPatchSchema } = require('../lib/validators');
@@ -18,6 +19,76 @@ const MAX_LIMIT = 100;
 const paginationSchema = z.object({
   page: z.coerce.number().int().min(1).default(DEFAULT_PAGE),
   limit: z.coerce.number().int().min(1).max(MAX_LIMIT).default(DEFAULT_LIMIT)
+});
+
+const toDoctorPublicSummary = (doctor) => ({
+  id: doctor.id,
+  name: doctor.name || doctor.full_name || null,
+  specialization: doctor.specialization || doctor.specialty || null,
+  bio: doctor.bio || null,
+  photo_url: doctor.photo_url || null,
+  consultation_duration_mins: doctor.consultation_duration_mins || doctor.slot_duration_mins || 30,
+  accepting_patients: typeof doctor.accepting_patients === 'boolean' ? doctor.accepting_patients : true
+});
+
+const toDoctorPublicDetail = (doctor) => ({
+  ...toDoctorPublicSummary(doctor),
+  working_hours: doctor.working_hours || null
+});
+
+publicRouter.get('/public', async (req, res, next) => {
+  try {
+    const { specialization, accepting_patients } = req.query;
+
+    let query = supabase
+      .from('doctors')
+      .select('*')
+      .eq('is_active', true)
+      .order('full_name', { ascending: true });
+
+    if (specialization) {
+      query = query.or(`specialization.ilike.%${specialization}%,specialty.ilike.%${specialization}%`);
+    }
+
+    if (accepting_patients === 'true') {
+      query = query.eq('accepting_patients', true);
+    } else if (accepting_patients === 'false') {
+      query = query.eq('accepting_patients', false);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    return res.json({
+      success: true,
+      data: (data || []).map(toDoctorPublicSummary)
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+publicRouter.get('/public/:id', async (req, res, next) => {
+  try {
+    const { data, error } = await supabase
+      .from('doctors')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('is_active', true)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) {
+      return res.status(404).json({ error: 'Doctor not found' });
+    }
+
+    return res.json({
+      success: true,
+      data: toDoctorPublicDetail(data)
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // GET all active doctors
@@ -177,4 +248,7 @@ router.patch('/:id', validate(doctorPatchSchema), async (req, res, next) => {
   }
 });
 
-module.exports = router;
+module.exports = {
+  router,
+  publicRouter
+};

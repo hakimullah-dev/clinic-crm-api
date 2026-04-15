@@ -54,6 +54,16 @@ const buildDayRange = (dateString) => {
   return { start, end };
 };
 
+const weekdayKeyByShortName = Object.freeze({
+  mon: 'mon',
+  tue: 'tue',
+  wed: 'wed',
+  thu: 'thu',
+  fri: 'fri',
+  sat: 'sat',
+  sun: 'sun'
+});
+
 const getPagination = (query = {}) => {
   const { page, limit } = paginationSchema.parse(query);
   const from = (page - 1) * limit;
@@ -73,6 +83,87 @@ const buildPaginationMeta = (page, limit, total) => ({
   total,
   pages: total === 0 ? 0 : Math.ceil(total / limit)
 });
+
+const getLocalDateParts = (dateString) => {
+  const [year, month, day] = String(dateString || '').split('-').map(Number);
+  if (!year || !month || !day) {
+    return null;
+  }
+
+  return { year, month, day };
+};
+
+const getSydneyDayWindow = (dateString) => {
+  const parts = getLocalDateParts(dateString);
+  if (!parts) {
+    return null;
+  }
+
+  const { year, month, day } = parts;
+  return {
+    start: new Date(year, month - 1, day, 0, 0, 0, 0),
+    end: new Date(year, month - 1, day, 23, 59, 59, 999)
+  };
+};
+
+const parseTimeToMinutes = (value) => {
+  if (typeof value !== 'string' || !/^\d{2}:\d{2}$/.test(value)) {
+    return null;
+  }
+
+  const [hours, minutes] = value.split(':').map(Number);
+  return (hours * 60) + minutes;
+};
+
+const formatTimeValue = (date) => `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
+
+const formatOffsetDateTime = (date) => {
+  const pad = (value) => String(value).padStart(2, '0');
+  const year = date.getFullYear();
+  const month = pad(date.getMonth() + 1);
+  const day = pad(date.getDate());
+  const hours = pad(date.getHours());
+  const minutes = pad(date.getMinutes());
+  const seconds = pad(date.getSeconds());
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const offsetHours = pad(Math.floor(absoluteOffset / 60));
+  const offsetMins = pad(absoluteOffset % 60);
+
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}${sign}${offsetHours}:${offsetMins}`;
+};
+
+const getDoctorWorkingWindow = (workingHours, date) => {
+  if (!workingHours || typeof workingHours !== 'object' || Array.isArray(workingHours)) {
+    return null;
+  }
+
+  const weekdayShort = date.toLocaleDateString('en-US', {
+    weekday: 'short',
+    timeZone: 'Australia/Sydney'
+  }).toLowerCase();
+
+  const weekdayLong = date.toLocaleDateString('en-US', {
+    weekday: 'long',
+    timeZone: 'Australia/Sydney'
+  }).toLowerCase();
+
+  const candidates = [
+    weekdayKeyByShortName[weekdayShort],
+    weekdayShort,
+    weekdayLong
+  ].filter(Boolean);
+
+  for (const key of candidates) {
+    const window = workingHours[key];
+    if (window && typeof window === 'object') {
+      return window;
+    }
+  }
+
+  return null;
+};
 
 const syncPatientBookingSnapshot = async (patientId) => {
   if (!patientId) {
@@ -276,69 +367,85 @@ router.get('/', async (req, res, next) => {
   }
 });
 
-// GET available slots for aa doctor on a date
-router.get('/slots/:doctorId', async (req, res, next) => {
+const handleAvailableSlots = async (req, res, next) => {
   try {
-    const { date } = req.query;
+    const doctorId = req.query.doctor_id || req.params.doctorId;
+    const { date, duration_mins: durationMinsParam } = req.query;
+
+    if (!doctorId) {
+      return res.status(400).json({ error: 'doctor_id query param required' });
+    }
     if (!date) return res.status(400).json({ error: 'date query param required' });
+
+    const dayWindow = getSydneyDayWindow(date);
+    if (!dayWindow) {
+      return res.status(400).json({ error: 'date must be in YYYY-MM-DD format' });
+    }
 
     const { data: doctor, error: docError } = await supabase
       .from('doctors')
       .select('*')
-      .eq('id', req.params.doctorId)
+      .eq('id', doctorId)
       .single();
 
     if (docError) return res.status(404).json({ error: 'Doctor not found' });
 
-    const dayName = new Date(date).toLocaleDateString('en-US', {
-      weekday: 'long',
-      timeZone: 'Australia/Brisbane'
-    });
-    if (!doctor.working_days.includes(dayName)) {
-      return res.json({ date, doctor_id: req.params.doctorId, available_slots: [], taken_slots: [] });
+    const workingWindow = getDoctorWorkingWindow(doctor.working_hours, dayWindow.start);
+    if (!workingWindow?.start || !workingWindow?.end) {
+      return res.json({ date, doctor_id: doctorId, available_slots: [], taken_slots: [] });
+    }
+
+    const durationMins = Number(durationMinsParam) || doctor.consultation_duration_mins || doctor.slot_duration_mins || 30;
+    const startTotal = parseTimeToMinutes(workingWindow.start);
+    const endTotal = parseTimeToMinutes(workingWindow.end);
+
+    if (startTotal === null || endTotal === null || durationMins <= 0 || startTotal >= endTotal) {
+      return res.json({ date, doctor_id: doctorId, available_slots: [], taken_slots: [] });
     }
 
     const slots = [];
-    const [startH, startM] = doctor.start_time.split(':').map(Number);
-    const [endH, endM] = doctor.end_time.split(':').map(Number);
-    let current = startH * 60 + startM;
-    const endTotal = endH * 60 + endM;
+    for (let current = startTotal; current + durationMins <= endTotal; current += durationMins) {
+      const slotDate = new Date(
+        dayWindow.start.getFullYear(),
+        dayWindow.start.getMonth(),
+        dayWindow.start.getDate(),
+        Math.floor(current / 60),
+        current % 60,
+        0,
+        0
+      );
 
-    while (current < endTotal) {
-      const h = Math.floor(current / 60).toString().padStart(2, '0');
-      const m = (current % 60).toString().padStart(2, '0');
-      slots.push(`${h}:${m}`);
-      current += doctor.slot_duration_mins;
+      slots.push({
+        time: formatTimeValue(slotDate),
+        datetime: formatOffsetDateTime(slotDate)
+      });
     }
-
-    const start = new Date(date);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(date);
-    end.setHours(23, 59, 59, 999);
 
     const { data: existing, error: existingError } = await supabase
       .from('appointments')
       .select('scheduled_at')
-      .eq('doctor_id', req.params.doctorId)
-      .gte('scheduled_at', start.toISOString())
-      .lte('scheduled_at', end.toISOString())
+      .eq('doctor_id', doctorId)
+      .gte('scheduled_at', dayWindow.start.toISOString())
+      .lte('scheduled_at', dayWindow.end.toISOString())
       .not('status', 'eq', 'cancelled');
 
     if (existingError) {
       throw existingError;
     }
 
-    const takenSlots = (existing || []).map((appointment) => {
-      const scheduledDate = new Date(appointment.scheduled_at);
-      return `${scheduledDate.getHours().toString().padStart(2, '0')}:${scheduledDate.getMinutes().toString().padStart(2, '0')}`;
-    });
+    const takenSlots = (existing || []).map((appointment) => formatTimeValue(new Date(appointment.scheduled_at)));
+    const takenSlotSet = new Set(takenSlots);
 
-    const availableSlots = slots.filter((slot) => !takenSlots.includes(slot));
-    res.json({ date, doctor_id: req.params.doctorId, available_slots: availableSlots, taken_slots: takenSlots });
+    const availableSlots = slots.filter((slot) => !takenSlotSet.has(slot.time));
+    res.json({ date, doctor_id: doctorId, available_slots: availableSlots, taken_slots: takenSlots });
   } catch (err) {
     next(err);
   }
-});
+};
+
+// GET available slots for a doctor on a date
+router.get('/slots', handleAvailableSlots);
+router.get('/slots/:doctorId', handleAvailableSlots);
 
 // GET doctor's schedule
 router.get('/doctor/:doctorId', async (req, res, next) => {

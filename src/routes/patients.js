@@ -122,7 +122,7 @@ router.get('/:id', async (req, res, next) => {
   }
 });
 
-// POST create patient (fixed: removed user_id)
+// POST create patient
 router.post('/', validate(patientCreateSchema), async (req, res, next) => {
   const { patientData, resolvedPassword } = sanitizePatientPayload(req.body);
   let authUserId = null;
@@ -132,7 +132,7 @@ router.post('/', validate(patientCreateSchema), async (req, res, next) => {
       return sendForbidden(res);
     }
 
-    // If password provided, create Supabase Auth user and profile (but don't link to patients table)
+    // If password is provided, create a linked auth user for patient self-service access.
     if (resolvedPassword) {
       if (!patientData.email) {
         return res.status(400).json({ error: 'Email is required when password is provided' });
@@ -159,10 +159,13 @@ router.post('/', validate(patientCreateSchema), async (req, res, next) => {
       }
     }
 
-    // Insert into patients table WITHOUT user_id (since column doesn't exist)
+    const patientInsert = authUserId
+      ? { ...patientData, user_id: authUserId }
+      : patientData;
+
     const { data, error } = await supabase
       .from('patients')
-      .insert(patientData)   // removed user_id
+      .insert(patientInsert)
       .select()
       .single();
 

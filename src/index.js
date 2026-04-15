@@ -152,11 +152,12 @@ app.get('/health', async (req, res) => {
 });
 
 app.use('/api/auth', publicAuthLimiter, lazyRouter(() => require('./routes/auth')));
+app.use('/api/doctors', lazyRouter(() => require('./routes/doctors').publicRouter));
 
 app.use('/api/webhooks', authenticate, authenticatedLimiter, lazyRouter(() => require('./routes/webhooks')));
 app.use('/api/patients', authenticate, authenticatedLimiter, lazyRouter(() => require('./routes/patients')));
 app.use('/api/appointments', authenticate, authenticatedLimiter, lazyRouter(() => require('./routes/appointments')));
-app.use('/api/doctors', authenticate, authenticatedLimiter, lazyRouter(() => require('./routes/doctors')));
+app.use('/api/doctors', authenticate, authenticatedLimiter, lazyRouter(() => require('./routes/doctors').router));
 app.use('/api/intake-forms', authenticate, authenticatedLimiter, lazyRouter(() => require('./routes/intake-forms')));
 app.use('/api/waitlist', authenticate, authenticatedLimiter, lazyRouter(() => require('./routes/waitlist')));
 app.use('/api/feedback', authenticate, authenticatedLimiter, lazyRouter(() => require('./routes/feedback')));
