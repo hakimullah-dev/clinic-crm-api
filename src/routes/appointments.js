@@ -107,7 +107,7 @@ const getSydneyDayWindow = (dateString) => {
 };
 
 const parseTimeToMinutes = (value) => {
-  if (typeof value !== 'string' || !/^\d{2}:\d{2}$/.test(value)) {
+  if (typeof value !== 'string' || !/^\d{2}:\d{2}(?::\d{2})?$/.test(value)) {
     return null;
   }
 
@@ -115,23 +115,30 @@ const parseTimeToMinutes = (value) => {
   return (hours * 60) + minutes;
 };
 
-const formatTimeValue = (date) => `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
+const formatMinutesAsTime = (minutes) => {
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}`;
+};
 
-const formatOffsetDateTime = (date) => {
-  const pad = (value) => String(value).padStart(2, '0');
-  const year = date.getFullYear();
-  const month = pad(date.getMonth() + 1);
-  const day = pad(date.getDate());
-  const hours = pad(date.getHours());
-  const minutes = pad(date.getMinutes());
-  const seconds = pad(date.getSeconds());
-  const offsetMinutes = -date.getTimezoneOffset();
-  const sign = offsetMinutes >= 0 ? '+' : '-';
-  const absoluteOffset = Math.abs(offsetMinutes);
-  const offsetHours = pad(Math.floor(absoluteOffset / 60));
-  const offsetMins = pad(absoluteOffset % 60);
+const getSydneyOffsetForDate = (dateString) => {
+  const probe = new Date(`${dateString}T12:00:00.000Z`);
+  const parts = new Intl.DateTimeFormat('en-AU', {
+    timeZone: 'Australia/Sydney',
+    timeZoneName: 'shortOffset'
+  }).formatToParts(probe);
+  const offset = parts.find((part) => part.type === 'timeZoneName')?.value || 'GMT+10';
+  const match = offset.match(/^GMT([+-]\d{1,2})(?::?(\d{2}))?$/);
 
-  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}${sign}${offsetHours}:${offsetMins}`;
+  if (!match) {
+    return '+10:00';
+  }
+
+  const hours = String(Math.abs(Number(match[1]))).padStart(2, '0');
+  const minutes = match[2] || '00';
+  const sign = match[1].startsWith('-') ? '-' : '+';
+
+  return `${sign}${hours}:${minutes}`;
 };
 
 const getDoctorWorkingWindow = (workingHours, date) => {
@@ -416,9 +423,8 @@ const handleAvailableSlots = async (req, res, next) => {
     if (docError) return res.status(404).json({ error: 'Doctor not found' });
 
     const schedule = getDoctorScheduleForDate(doctor, dayWindow.start);
-    const bookingDay = new Date(dayWindow.start).toLocaleDateString('en-AU', {
-      weekday: 'long',
-      timeZone: 'Australia/Sydney'
+    const bookingDay = new Date(`${date}T12:00:00`).toLocaleDateString('en-US', {
+      weekday: 'long'
     }).toLowerCase();
     const doctorDays = (schedule.workingDays || []).map((value) => String(value).toLowerCase());
 
@@ -427,28 +433,22 @@ const handleAvailableSlots = async (req, res, next) => {
     }
 
     const durationMins = Number(durationMinsParam) || schedule.consultationDuration || schedule.slotDuration || 30;
-    const startTotal = parseTimeToMinutes(schedule.startTime);
-    const endTotal = parseTimeToMinutes(schedule.endTime);
+    const startValue = schedule.startTime || '09:00:00';
+    const endValue = schedule.endTime || '18:00:00';
+    const startTotal = parseTimeToMinutes(startValue);
+    const endTotal = parseTimeToMinutes(endValue);
 
     if (startTotal === null || endTotal === null || durationMins <= 0 || startTotal >= endTotal) {
       return res.json({ date, doctor_id: doctorId, available_slots: [], taken_slots: [] });
     }
 
     const slots = [];
+    const sydneyOffset = getSydneyOffsetForDate(date);
     for (let current = startTotal; current + durationMins <= endTotal; current += durationMins) {
-      const slotDate = new Date(
-        dayWindow.start.getFullYear(),
-        dayWindow.start.getMonth(),
-        dayWindow.start.getDate(),
-        Math.floor(current / 60),
-        current % 60,
-        0,
-        0
-      );
-
+      const time = formatMinutesAsTime(current);
       slots.push({
-        time: formatTimeValue(slotDate),
-        datetime: formatOffsetDateTime(slotDate)
+        time,
+        datetime: `${date}T${time}:00${sydneyOffset}`
       });
     }
 
@@ -464,7 +464,15 @@ const handleAvailableSlots = async (req, res, next) => {
       throw existingError;
     }
 
-    const takenSlots = (existing || []).map((appointment) => formatTimeValue(new Date(appointment.scheduled_at)));
+    const takenSlots = (existing || []).map((appointment) => {
+      const scheduledAt = new Date(appointment.scheduled_at);
+      return scheduledAt.toLocaleTimeString('en-GB', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+        timeZone: 'Australia/Sydney'
+      });
+    });
     const takenSlotSet = new Set(takenSlots);
 
     const availableSlots = slots.filter((slot) => !takenSlotSet.has(slot.time));
