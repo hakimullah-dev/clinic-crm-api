@@ -85,6 +85,23 @@ const createUserAccount = async (req, res, options = {}) => {
   let createdUserId;
 
   try {
+    if (options.allowExistingUser) {
+      const { data: existingUsersData, error: existingUsersError } = await supabase.auth.admin.listUsers();
+
+      if (!existingUsersError) {
+        const existingUsers = existingUsersData?.users || [];
+        const alreadyExists = existingUsers.find((user) => String(user.email || '').trim().toLowerCase() === email);
+
+        if (alreadyExists) {
+          return res.status(200).json({
+            success: true,
+            message: 'Account already exists',
+            existing: true
+          });
+        }
+      }
+    }
+
     const { data: createdUser, error: createError } = await supabase.auth.admin.createUser({
       email,
       password: resolvedPassword,
@@ -96,6 +113,18 @@ const createUserAccount = async (req, res, options = {}) => {
     });
 
     if (createError || !createdUser.user) {
+      if (
+        options.allowExistingUser
+        && (createError?.status === 422
+          || /already|duplicate/i.test(createError?.message || ''))
+      ) {
+        return res.status(200).json({
+          success: true,
+          message: 'Account already exists',
+          existing: true
+        });
+      }
+
       return res.status(400).json({ error: createError?.message || 'Unable to create user. Verify the Supabase auth configuration and retry.', details: [] });
     }
 
@@ -164,6 +193,7 @@ router.post('/signup', validate(authSignupSchema), async (req, res) => {
 
   return createUserAccount(req, res, {
     forceRole: ROLES.PATIENT,
+    allowExistingUser: true,
     successMessage: 'Patient account created successfully',
     failureMessage: 'Failed to sign up user'
   });

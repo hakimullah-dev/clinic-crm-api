@@ -233,7 +233,41 @@ router.patch('/:id', validate(doctorPatchSchema), async (req, res, next) => {
       return sendForbidden(res, 'Doctor profile is not linked to this user');
     }
 
-    const doctorData = req.body;
+    const {
+      full_name,
+      email,
+      specialty,
+      specialization,
+      working_days,
+      start_time,
+      end_time,
+      slot_duration_mins,
+      consultation_duration_mins,
+      accepting_patients
+    } = req.body;
+
+    const doctorData = {};
+    if (full_name !== undefined) doctorData.full_name = full_name;
+    if (email !== undefined) doctorData.email = email;
+    if (specialty !== undefined) doctorData.specialty = specialty;
+    if (specialization !== undefined) doctorData.specialization = specialization;
+    if (working_days !== undefined) {
+      doctorData.working_days = Array.isArray(working_days)
+        ? working_days.map((day) => String(day).toLowerCase())
+        : working_days;
+    }
+    if (start_time !== undefined) doctorData.start_time = start_time;
+    if (end_time !== undefined) doctorData.end_time = end_time;
+    if (slot_duration_mins !== undefined) doctorData.slot_duration_mins = slot_duration_mins;
+    if (consultation_duration_mins !== undefined) doctorData.consultation_duration_mins = consultation_duration_mins;
+    if (accepting_patients !== undefined) doctorData.accepting_patients = accepting_patients;
+
+    if (Object.keys(doctorData).length === 0) {
+      return res.status(400).json({ error: 'No valid doctor fields provided' });
+    }
+
+    doctorData.updated_at = new Date().toISOString();
+
     const { data, error } = await supabase
       .from('doctors')
       .update(doctorData)

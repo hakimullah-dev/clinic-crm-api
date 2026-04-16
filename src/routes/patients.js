@@ -191,12 +191,34 @@ router.patch('/:id', validate(patientPatchSchema), async (req, res, next) => {
     const allowed = await canAccessPatient(req, req.params.id);
     if (!allowed) return sendForbidden(res);
     if (hasAnyRole(req, ROLES.DOCTOR)) return sendForbidden(res);
-    if (Object.keys(patientData).length === 0) {
+    const {
+      full_name,
+      phone,
+      email,
+      gender,
+      date_of_birth,
+      allergies,
+      medical_notes
+    } = patientData;
+
+    const updateData = {};
+    if (full_name !== undefined) updateData.full_name = full_name;
+    if (phone !== undefined) updateData.phone = phone;
+    if (email !== undefined) updateData.email = email;
+    if (gender !== undefined) updateData.gender = gender;
+    if (date_of_birth !== undefined) updateData.date_of_birth = date_of_birth;
+    if (allergies !== undefined) updateData.allergies = allergies;
+    if (medical_notes !== undefined) updateData.medical_notes = medical_notes;
+
+    if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ error: 'No valid patient fields provided' });
     }
+
+    updateData.updated_at = new Date().toISOString();
+
     const { data, error } = await supabase
       .from('patients')
-      .update(patientData)
+      .update(updateData)
       .eq('id', req.params.id)
       .select()
       .single();

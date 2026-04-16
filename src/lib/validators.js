@@ -379,7 +379,12 @@ const patientCreateSchema = buildCreateSchema({
   temporary_password: authPasswordSchema.optional()
 });
 
-const patientPatchSchema = buildPatchSchema(patientShape, ['id', 'created_at', 'user_id']);
+const patientPatchSchema = buildPatchSchema({
+  ...patientShape,
+  gender: optionalTrimmedString('gender', 1, 20),
+  allergies: optionalTrimmedString('allergies', 1, 2000),
+  medical_notes: optionalTrimmedString('medical_notes', 1, 5000)
+}, ['id', 'created_at', 'user_id']);
 
 const doctorCreateSchema = buildCreateSchema(doctorShape).superRefine((data, ctx) => {
   if (parseTimeToMinutes(data.end_time) <= parseTimeToMinutes(data.start_time)) {
@@ -395,10 +400,17 @@ const doctorPatchSchema = buildPatchSchema({
   full_name: doctorShape.full_name,
   email: doctorShape.email,
   specialty: doctorShape.specialty,
+  specialization: trimmedString('specialization', 2, 100),
   working_days: doctorShape.working_days,
   start_time: doctorShape.start_time,
   end_time: doctorShape.end_time,
-  slot_duration_mins: doctorShape.slot_duration_mins
+  slot_duration_mins: doctorShape.slot_duration_mins,
+  consultation_duration_mins: z.coerce.number({ invalid_type_error: 'consultation_duration_mins must be a number' })
+    .int('consultation_duration_mins must be an integer')
+    .refine((value) => DOCTOR_SLOT_DURATIONS.includes(value), {
+      message: `consultation_duration_mins must be one of: ${DOCTOR_SLOT_DURATIONS.join(', ')}`
+    }),
+  accepting_patients: z.boolean()
 }, ['id', 'created_at', 'user_id']).superRefine((data, ctx) => {
   if (data.start_time && data.end_time && parseTimeToMinutes(data.end_time) <= parseTimeToMinutes(data.start_time)) {
     ctx.addIssue({

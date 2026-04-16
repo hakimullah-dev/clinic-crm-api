@@ -165,6 +165,31 @@ const getDoctorWorkingWindow = (workingHours, date) => {
   return null;
 };
 
+const getDoctorScheduleForDate = (doctor, date) => {
+  const configuredWindow = getDoctorWorkingWindow(doctor.working_hours, date);
+  if (configuredWindow?.start && configuredWindow?.end) {
+    return {
+      startTime: configuredWindow.start,
+      endTime: configuredWindow.end,
+      slotDuration: doctor.slot_duration_mins || 30,
+      consultationDuration: doctor.consultation_duration_mins || doctor.slot_duration_mins || 30,
+      workingDays: Array.isArray(doctor.working_days) && doctor.working_days.length
+        ? doctor.working_days
+        : ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
+    };
+  }
+
+  return {
+    startTime: doctor.start_time || '09:00',
+    endTime: doctor.end_time || '18:00',
+    slotDuration: doctor.slot_duration_mins || 30,
+    consultationDuration: doctor.consultation_duration_mins || doctor.slot_duration_mins || 30,
+    workingDays: Array.isArray(doctor.working_days) && doctor.working_days.length
+      ? doctor.working_days
+      : ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
+  };
+};
+
 const syncPatientBookingSnapshot = async (patientId) => {
   if (!patientId) {
     return;
@@ -390,14 +415,20 @@ const handleAvailableSlots = async (req, res, next) => {
 
     if (docError) return res.status(404).json({ error: 'Doctor not found' });
 
-    const workingWindow = getDoctorWorkingWindow(doctor.working_hours, dayWindow.start);
-    if (!workingWindow?.start || !workingWindow?.end) {
+    const schedule = getDoctorScheduleForDate(doctor, dayWindow.start);
+    const bookingDay = new Date(dayWindow.start).toLocaleDateString('en-AU', {
+      weekday: 'long',
+      timeZone: 'Australia/Sydney'
+    }).toLowerCase();
+    const doctorDays = (schedule.workingDays || []).map((value) => String(value).toLowerCase());
+
+    if (!doctorDays.includes(bookingDay)) {
       return res.json({ date, doctor_id: doctorId, available_slots: [], taken_slots: [] });
     }
 
-    const durationMins = Number(durationMinsParam) || doctor.consultation_duration_mins || doctor.slot_duration_mins || 30;
-    const startTotal = parseTimeToMinutes(workingWindow.start);
-    const endTotal = parseTimeToMinutes(workingWindow.end);
+    const durationMins = Number(durationMinsParam) || schedule.consultationDuration || schedule.slotDuration || 30;
+    const startTotal = parseTimeToMinutes(schedule.startTime);
+    const endTotal = parseTimeToMinutes(schedule.endTime);
 
     if (startTotal === null || endTotal === null || durationMins <= 0 || startTotal >= endTotal) {
       return res.json({ date, doctor_id: doctorId, available_slots: [], taken_slots: [] });
