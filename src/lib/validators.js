@@ -375,6 +375,9 @@ const buildPatchSchema = (shape, forbiddenFields = []) => z.object(shape).partia
 
 const patientCreateSchema = buildCreateSchema({
   ...patientShape,
+  gender: optionalTrimmedString('gender', 1, 20),
+  allergies: optionalTrimmedString('allergies', 1, 2000),
+  medical_notes: optionalTrimmedString('medical_notes', 1, 5000),
   password: authPasswordSchema.optional(),
   temporary_password: authPasswordSchema.optional()
 });
@@ -386,7 +389,16 @@ const patientPatchSchema = buildPatchSchema({
   medical_notes: optionalTrimmedString('medical_notes', 1, 5000)
 }, ['id', 'created_at', 'user_id']);
 
-const doctorCreateSchema = buildCreateSchema(doctorShape).superRefine((data, ctx) => {
+const doctorCreateSchema = buildCreateSchema({
+  ...doctorShape,
+  specialization: trimmedString('specialization', 2, 100).optional(),
+  consultation_duration_mins: z.coerce.number({ invalid_type_error: 'consultation_duration_mins must be a number' })
+    .int('consultation_duration_mins must be an integer')
+    .refine((value) => DOCTOR_SLOT_DURATIONS.includes(value), {
+      message: `consultation_duration_mins must be one of: ${DOCTOR_SLOT_DURATIONS.join(', ')}`
+    }).optional(),
+  accepting_patients: z.boolean().optional()
+}).superRefine((data, ctx) => {
   if (parseTimeToMinutes(data.end_time) <= parseTimeToMinutes(data.start_time)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,

@@ -83,6 +83,20 @@ const createUserAccount = async (req, res, options = {}) => {
   }
 
   let createdUserId;
+  let createdPatientId;
+
+  const cleanupCreatedUser = async () => {
+    if (createdPatientId) {
+      await supabase.from('patients').delete().eq('id', createdPatientId);
+      createdPatientId = null;
+    }
+
+    if (createdUserId) {
+      await supabase.from('user_profiles').delete().eq('user_id', createdUserId);
+      await supabase.auth.admin.deleteUser(createdUserId);
+      createdUserId = null;
+    }
+  };
 
   try {
     if (options.allowExistingUser) {
@@ -138,8 +152,31 @@ const createUserAccount = async (req, res, options = {}) => {
       });
 
     if (profileError) {
-      await supabase.auth.admin.deleteUser(createdUserId);
+      await cleanupCreatedUser();
       return res.status(400).json({ error: profileError.message, details: [] });
+    }
+
+    if (options.createPatientRecord) {
+      const { data: patientRecord, error: patientError } = await supabase
+        .from('patients')
+        .insert({
+          user_id: createdUserId,
+          full_name: resolvedFullName || email,
+          email,
+          phone: phone || null
+        })
+        .select('id')
+        .single();
+
+      if (patientError || !patientRecord) {
+        await cleanupCreatedUser();
+        return res.status(400).json({
+          error: patientError?.message || 'Unable to create linked patient profile. Verify the patients table schema and retry.',
+          details: []
+        });
+      }
+
+      createdPatientId = patientRecord.id;
     }
 
     const { data: loginData, error: loginError } = await authClient.auth.signInWithPassword({
@@ -170,9 +207,7 @@ const createUserAccount = async (req, res, options = {}) => {
       message: options.successMessage || 'User created successfully'
     });
   } catch (error) {
-    if (createdUserId) {
-      await supabase.auth.admin.deleteUser(createdUserId);
-    }
+    await cleanupCreatedUser();
 
     logError('user_creation_failed', {
       requestId: req.res?.locals?.requestId,
@@ -194,6 +229,7 @@ router.post('/signup', validate(authSignupSchema), async (req, res) => {
   return createUserAccount(req, res, {
     forceRole: ROLES.PATIENT,
     allowExistingUser: true,
+    createPatientRecord: true,
     successMessage: 'Patient account created successfully',
     failureMessage: 'Failed to sign up user'
   });
