@@ -551,6 +551,8 @@ router.post('/', async (req, res, next) => {
   }
 }, validate(appointmentCreateSchema), async (req, res, next) => {
   try {
+    console.log(req.body);
+
     if (hasAnyRole(req, ROLES.PATIENT)) {
       if (!req.user.patientId) {
         return sendForbidden(res, 'Patient profile is not linked to this user');
@@ -564,18 +566,51 @@ router.post('/', async (req, res, next) => {
     }
 
     const payload = {
-      ...req.body,
       patient_id: hasAnyRole(req, ROLES.PATIENT) ? req.user.patientId : req.body?.patient_id
     };
 
-    const { data, error } = await supabase
+    const appointmentPayload = {
+      patient_id: payload.patient_id,
+      doctor_id: req.body.doctor_id,
+      scheduled_at: req.body.scheduled_at,
+      status: req.body.status,
+      booking_source: req.body.booking_source,
+      notes: req.body.notes
+    };
+
+    const requiredFields = ['patient_id', 'doctor_id', 'scheduled_at', 'status'];
+    const missingFields = requiredFields.filter((field) => !appointmentPayload[field]);
+    if (missingFields.length) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: missingFields.map((field) => ({
+          field,
+          message: `${field} is required`
+        }))
+      });
+    }
+
+    const { data: createdAppointment, error: insertError } = await supabase
       .from('appointments')
-      .insert(payload)
-      .select('*, patients(*), doctors(*)')
+      .insert(appointmentPayload)
+      .select('id')
       .single();
 
-    if (error) throw error;
-    await syncPatientBookingSnapshot(payload.patient_id);
+    if (insertError) {
+      throw insertError;
+    }
+
+    const { data, error } = await supabase
+      .from('appointments')
+      .select('*, patients(*), doctors(*)')
+      .eq('id', createdAppointment.id)
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    await syncPatientBookingSnapshot(appointmentPayload.patient_id);
 
     void fireWebhook('booking.complete', {
       appointment_id: data.id,
@@ -583,11 +618,19 @@ router.post('/', async (req, res, next) => {
       doctor_id: data.doctor_id,
       scheduled_at: data.scheduled_at,
       status: data.status,
-      booking_source: data.booking_source || payload.booking_source || null
+      booking_source: data.booking_source || appointmentPayload.booking_source || null
     });
 
     res.status(201).json(data);
   } catch (err) {
+    console.error('Appointment creation failed', {
+      body: req.body,
+      message: err.message,
+      code: err.code,
+      details: err.details,
+      hint: err.hint,
+      stack: err.stack
+    });
     next(err);
   }
 });
