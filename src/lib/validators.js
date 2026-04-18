@@ -455,14 +455,7 @@ const appointmentStatusPatchSchema = buildCreateSchema({
 });
 
 const appointmentRescheduleSchema = buildCreateSchema({
-  scheduled_at: z.string()
-    .datetime('scheduled_at must be a valid ISO datetime string')
-    .refine((value) => new Date(value).getTime() > Date.now(), {
-      message: 'scheduled_at must be in the future'
-    })
-    .refine(isWithinClinicHours, {
-      message: 'scheduled_at must be within clinic hours (Mon-Sat 09:00-18:00 AEST)'
-    }),
+  scheduled_at: isoDateTimeSchema,
   reason: z.string().trim().max(500, 'reason must be at most 500 characters').optional(),
   google_event_id: z.string().trim().max(255, 'google_event_id must be at most 255 characters').optional()
 });
