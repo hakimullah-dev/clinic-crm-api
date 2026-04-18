@@ -415,11 +415,16 @@ router.delete('/:id', async (req, res, next) => {
     const { data: appointment, error: appointmentError } = await supabase.from('appointments').select('id, patient_id, status, scheduled_at, cancelled_at').eq('id', req.params.id).maybeSingle();
     if (appointmentError) throw appointmentError;
     if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
+    if (appointment.status === 'cancelled') return res.status(409).json({ error: 'Appointment is already cancelled' });
     const cancelledAt = new Date().toISOString();
     const { error: updateError } = await supabase.from('appointments').update({ status: 'cancelled', cancelled_at: cancelledAt }).eq('id', req.params.id);
     if (updateError) throw updateError;
     syncPatientBookingSnapshot(appointment.patient_id).catch((err) => console.error('Background sync error:', err));
-    void fireWebhook('appointment.cancelled', { appointment_id: appointment.id, patient_id: appointment.patient_id, cancelled_at: cancelledAt });
+    try {
+      await fireWebhook('appointment.cancelled', { appointment_id: appointment.id, patient_id: appointment.patient_id, cancelled_at: cancelledAt });
+    } catch (webhookErr) {
+      console.error('Webhook failed (non-fatal):', webhookErr.message);
+    }
     await logAudit({ userId: req.user?.id || null, role: req.user?.role || 'unknown', action: 'appointment_cancelled', resourceType: 'appointment', resourceId: appointment.id, oldValues: appointment, newValues: { status: 'cancelled', cancelled_at: cancelledAt }, ipAddress: req.ip });
     return res.json({ success: true, appointment_id: appointment.id, cancelled_at: cancelledAt });
   } catch (err) { next(err); }
