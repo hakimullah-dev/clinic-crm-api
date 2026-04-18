@@ -27,6 +27,32 @@ const buildDate = (value) => {
   return new Date(value);
 };
 
+const parseIsoDateTimeWithOffset = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const match = value.trim().match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  const [, year, month, day, hour, minute, second = '00'] = match;
+  const parsed = new Date(value);
+
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+
+  return {
+    dayOfWeek: new Date(Date.UTC(Number(year), Number(month) - 1, Number(day))).getUTCDay(),
+    totalSeconds: (Number(hour) * 60 * 60) + (Number(minute) * 60) + Number(second)
+  };
+};
+
 const getClinicDateParts = (value) => {
   const date = buildDate(value);
   if (Number.isNaN(date.getTime())) {
@@ -82,6 +108,14 @@ function isClinicDay(value) {
  * @returns {boolean}
  */
 function isClinicHours(value) {
+  const parsedWithOffset = parseIsoDateTimeWithOffset(value);
+  if (parsedWithOffset) {
+    return parsedWithOffset.dayOfWeek >= 1
+      && parsedWithOffset.dayOfWeek <= 6
+      && parsedWithOffset.totalSeconds >= 9 * 60 * 60
+      && parsedWithOffset.totalSeconds <= 18 * 60 * 60;
+  }
+
   const parts = getClinicDateParts(value);
   if (!parts) {
     return false;

@@ -250,7 +250,7 @@ const notesSchema = z
     const sanitized = sanitizeString(stripHtml(value));
     return sanitized || undefined;
   })
-  .pipe(z.string().max(500, 'notes must be at most 500 characters').optional());
+  .pipe(z.string().max(2000, 'notes must be at most 2000 characters').optional());
 
 const commentSchema = z
   .union([z.string(), z.null(), z.undefined()])
