@@ -432,12 +432,22 @@ router.delete('/:id', async (req, res, next) => {
 router.post('/:id/reschedule', validate(appointmentRescheduleSchema), async (req, res, next) => {
   try {
     const { scheduled_at: scheduledAt, reason, google_event_id: googleEventId } = req.body;
-    const scoped = await getScopedAppointment(req, req.params.id, '*, patients(*), doctors(*)');
-    if (scoped.notFound) return res.status(404).json({ error: 'Appointment not found', details: [] });
-    const appointment = scoped.appointment;
-    const doctorAllowed = hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT)
-      || (hasAnyRole(req, ROLES.DOCTOR) && String(req.user?.doctorId) === String(appointment.doctor_id));
-    if (!doctorAllowed) return sendForbidden(res);
+    if (!hasAnyRole(req, ROLES.ADMIN, ROLES.RECEPTIONIST, ROLES.N8N_AGENT, ROLES.DOCTOR)) {
+      return sendForbidden(res);
+    }
+
+    const { data: appointment, error: fetchError } = await supabase
+      .from('appointments')
+      .select('*, patients(*), doctors(*)')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (fetchError) throw fetchError;
+    if (!appointment) return res.status(404).json({ error: 'Appointment not found', details: [] });
+
+    if (hasAnyRole(req, ROLES.DOCTOR) && String(req.user?.doctorId) !== String(appointment.doctor_id)) {
+      return sendForbidden(res);
+    }
     const slotAvailable = await ensureSlotAvailable({ appointmentId: appointment.id, doctorId: appointment.doctor_id, scheduledAt });
     if (!slotAvailable) return res.status(400).json({ error: 'Validation failed', details: [{ field: 'scheduled_at', message: 'Selected slot is no longer available' }] });
     const updatePayload = { scheduled_at: scheduledAt, cancellation_reason: reason || appointment.cancellation_reason || null, cancelled_at: null };
